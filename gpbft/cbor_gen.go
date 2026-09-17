@@ -187,8 +187,10 @@ func (t *LegacyECChain) MarshalCBOR(w io.Writer) error {
 	cw := cbg.NewCborWriter(w)
 
 	// (*t) (gpbft.LegacyECChain) (slice)
-	if len((*t)) > 8192 {
-		return xerrors.Errorf("Slice value in field (*t) was too long")
+	// Enforce ChainMaxLen to prevent oversized allocations before validation.
+	// This is a manual fix for the generated code: previously allowed 8192.
+	if len((*t)) > ChainMaxLen {
+		return xerrors.Errorf("Slice value in field (*t) was too long: %d > %d", len((*t)), ChainMaxLen)
 	}
 
 	if err := cw.WriteMajorTypeHeader(cbg.MajArray, uint64(len((*t)))); err != nil {
@@ -218,8 +220,10 @@ func (t *LegacyECChain) UnmarshalCBOR(r io.Reader) (err error) {
 		return err
 	}
 
-	if extra > 8192 {
-		return fmt.Errorf("(*t): array too large (%d)", extra)
+	// Enforce ChainMaxLen to prevent oversized allocations before validation.
+	// Previously allowed 8192, which allowed DoS via large allocations.
+	if extra > uint64(ChainMaxLen) {
+		return fmt.Errorf("(*t): array too large (%d > %d)", extra, ChainMaxLen)
 	}
 
 	if maj != cbg.MajArray {

@@ -31,6 +31,11 @@ type discoveredChain struct {
 	chain    *gpbft.ECChain
 }
 
+type chainKeyMeta struct {
+	firstSeen time.Time
+	missCount int
+}
+
 type PartialMessageManager struct {
 	chainex *chainexchange.PubSubChainExchange
 
@@ -40,6 +45,12 @@ type PartialMessageManager struct {
 	// pmkByInstanceByChainKey is used for an auxiliary lookup of all partial
 	// messages for a given vote value at an instance.
 	pmkByInstanceByChainKey map[uint64]map[gpbft.ECChainKey][]partialMessageKey
+	// chainKeyMeta tracks first-seen time and miss count for each chain key per instance,
+	// used to expire vanished chains (analogous to LP deposit vanish tracker).
+	chainKeyMeta map[uint64]map[gpbft.ECChainKey]*chainKeyMeta
+	// senderCount tracks per-sender message count per instance for rate limiting
+	// (fix for unauthenticated flooding similar to LP #92900).
+	senderCount map[uint64]map[gpbft.ActorID]int
 	// pendingPartialMessages is a channel of partial messages that are pending to be buffered.
 	pendingPartialMessages chan gpbft.PartiallyValidatedMessage
 	// pendingDiscoveredChains is a channel of chains discovered by chainexchange
@@ -57,21 +68,35 @@ type PartialMessageManager struct {
 	completedMsgsBufSize int
 	clk                  clock.Clock
 
+	// Hardening limits
+	maxChainKeysPerInstance      int
+	maxMessagesPerSenderPerInst  int
+	chainKeyExpiry               time.Duration
+	chainKeyVanishMissThreshold  int
+	chainKeyVanishDepth          time.Duration
+
 	stop func()
 }
 
 func NewPartialMessageManager(progress gpbft.Progress, ps *pubsub.PubSub, m manifest.Manifest, clk clock.Clock) (*PartialMessageManager, error) {
 	pmm := &PartialMessageManager{
-		pmByInstance:            make(map[uint64]*lru.Cache[partialMessageKey, gpbft.PartiallyValidatedMessage]),
-		pmkByInstanceByChainKey: make(map[uint64]map[gpbft.ECChainKey][]partialMessageKey),
-		pendingDiscoveredChains: make(chan *discoveredChain, m.PartialMessageManager.PendingDiscoveredChainsBufferSize),
-		pendingPartialMessages:  make(chan gpbft.PartiallyValidatedMessage, m.PartialMessageManager.PendingPartialMessagesBufferSize),
-		pendingChainBroadcasts:  make(chan chainexchange.Message, m.PartialMessageManager.PendingChainBroadcastsBufferSize),
-		pendingInstanceRemoval:  make(chan uint64, m.PartialMessageManager.PendingInstanceRemovalBufferSize),
-		rebroadcastInterval:     m.ChainExchange.RebroadcastInterval,
-		maxBuffMsgPerInstance:   m.PartialMessageManager.MaxBufferedMessagesPerInstance,
-		completedMsgsBufSize:    m.PartialMessageManager.CompletedMessagesBufferSize,
-		clk:                     clk,
+		pmByInstance:                 make(map[uint64]*lru.Cache[partialMessageKey, gpbft.PartiallyValidatedMessage]),
+		pmkByInstanceByChainKey:      make(map[uint64]map[gpbft.ECChainKey][]partialMessageKey),
+		chainKeyMeta:                 make(map[uint64]map[gpbft.ECChainKey]*chainKeyMeta),
+		senderCount:                  make(map[uint64]map[gpbft.ActorID]int),
+		pendingDiscoveredChains:      make(chan *discoveredChain, m.PartialMessageManager.PendingDiscoveredChainsBufferSize),
+		pendingPartialMessages:       make(chan gpbft.PartiallyValidatedMessage, m.PartialMessageManager.PendingPartialMessagesBufferSize),
+		pendingChainBroadcasts:       make(chan chainexchange.Message, m.PartialMessageManager.PendingChainBroadcastsBufferSize),
+		pendingInstanceRemoval:       make(chan uint64, m.PartialMessageManager.PendingInstanceRemovalBufferSize),
+		rebroadcastInterval:          m.ChainExchange.RebroadcastInterval,
+		maxBuffMsgPerInstance:        m.PartialMessageManager.MaxBufferedMessagesPerInstance,
+		completedMsgsBufSize:         m.PartialMessageManager.CompletedMessagesBufferSize,
+		clk:                          clk,
+		maxChainKeysPerInstance:      100,              // prevent chain-key grinding from monopolising budget
+		maxMessagesPerSenderPerInst:  50,               // per-sender cap similar to LP anonymous locking cap
+		chainKeyExpiry:               5 * time.Minute,  // expire vanished chains
+		chainKeyVanishMissThreshold:  3,                // after 3 misses
+		chainKeyVanishDepth:          30 * time.Second, // and 30s depth, drop the chain key
 	}
 	var err error
 	pmm.chainex, err = chainexchange.NewPubSubChainExchange(
@@ -107,10 +132,60 @@ func (pmm *PartialMessageManager) Start(ctx context.Context) (<-chan gpbft.Parti
 			log.Debugw("Partial message manager stopped.")
 		}()
 
+		// Periodic cleanup of vanished chain keys (fix for permanent lock via reorged deposits #93205)
+		cleanupTicker := pmm.clk.Ticker(30 * time.Second)
+		defer cleanupTicker.Stop()
+
 		for ctx.Err() == nil {
 			select {
 			case <-ctx.Done():
 				return
+				case <-cleanupTicker.C:
+				now := pmm.clk.Now()
+				for inst, metaMap := range pmm.chainKeyMeta {
+					for ckey, meta := range metaMap {
+						if now.Sub(meta.firstSeen) > pmm.chainKeyExpiry {
+							// Expire vanished chain: remove all partial messages for this key
+							if pmk, ok := pmm.pmkByInstanceByChainKey[inst]; ok {
+								if keys, ok := pmk[ckey]; ok {
+									if buf, ok := pmm.pmByInstance[inst]; ok {
+										for _, k := range keys {
+											buf.Remove(k)
+											metrics.partialMessages.Add(ctx, -1)
+										}
+									}
+									delete(pmk, ckey)
+								}
+							}
+							delete(metaMap, ckey)
+							log.Warnw("Expired vanished chain key (no discovery)", "instance", inst, "chainKey", ckey)
+						} else if meta.missCount >= pmm.chainKeyVanishMissThreshold && now.Sub(meta.firstSeen) > pmm.chainKeyVanishDepth {
+							// Vanish tracker: chain wanted but never discovered, similar to LP deposit vanish
+							if pmk, ok := pmm.pmkByInstanceByChainKey[inst]; ok {
+								if keys, ok := pmk[ckey]; ok {
+									if buf, ok := pmm.pmByInstance[inst]; ok {
+										for _, k := range keys {
+											buf.Remove(k)
+											metrics.partialMessages.Add(ctx, -1)
+										}
+									}
+									delete(pmk, ckey)
+								}
+							}
+							delete(metaMap, ckey)
+							log.Warnw("Vanished chain key terminalized after consecutive misses", "instance", inst, "chainKey", ckey, "missCount", meta.missCount)
+						}
+					}
+					if len(metaMap) == 0 {
+						delete(pmm.chainKeyMeta, inst)
+					}
+				}
+				// Also cleanup sender counts for old instances
+				for inst := range pmm.senderCount {
+					if inst+10 < pmm.getMinBufferedInstance() {
+						delete(pmm.senderCount, inst)
+					}
+				}
 			case discovered, ok := <-pmm.pendingDiscoveredChains:
 				if !ok {
 					return
@@ -160,27 +235,101 @@ func (pmm *PartialMessageManager) Start(ctx context.Context) (<-chan gpbft.Parti
 						}
 						buffer.Remove(messageKey)
 						metrics.partialMessages.Add(ctx, -1)
+						// Decrement sender count
+						if sc, ok := pmm.senderCount[discovered.instance]; ok {
+							if cnt, ok := sc[messageKey.sender]; ok && cnt > 0 {
+								sc[messageKey.sender] = cnt - 1
+							}
+						}
 					}
 				}
 				delete(partialMessageKeysAtInstance, chainkey)
+				// Clean up meta for discovered chain
+				if metaMap, ok := pmm.chainKeyMeta[discovered.instance]; ok {
+					delete(metaMap, chainkey)
+					if len(metaMap) == 0 {
+						delete(pmm.chainKeyMeta, discovered.instance)
+					}
+				}
 			case pvgmsg, ok := <-pmm.pendingPartialMessages:
 				pgmsg := pvgmsg.PartialMessage()
 				if !ok {
 					return
 				}
+				// Rate limiting per sender (fix for unauthenticated flooding #92900)
+				inst := pgmsg.Vote.Instance
+				sender := pgmsg.Sender
+				if sc, ok := pmm.senderCount[inst]; ok {
+					if cnt, ok := sc[sender]; ok && cnt >= pmm.maxMessagesPerSenderPerInst {
+						// Drop message from sender that exceeded cap
+						metrics.partialMessagesDropped.Add(ctx, 1, metric.WithAttributes(attribute.String("kind", "per_sender_cap")))
+						continue
+					}
+				}
+
 				key := partialMessageKey{
-					sender: pgmsg.Sender,
+					sender: sender,
 					instant: gpbft.Instant{
-						ID:    pgmsg.Vote.Instance,
+						ID:    inst,
 						Round: pgmsg.Vote.Round,
 						Phase: pgmsg.Vote.Phase,
 					},
 				}
-				buffer := pmm.getOrInitPartialMessageBuffer(pgmsg.Vote.Instance)
+				buffer := pmm.getOrInitPartialMessageBuffer(inst)
+
+				// Enforce max distinct chain keys per instance to prevent grinding
+				pmkByChainKey := pmm.pmkByInstanceByChainKey[inst]
+				if _, exists := pmkByChainKey[pgmsg.VoteValueKey]; !exists {
+					if len(pmkByChainKey) >= pmm.maxChainKeysPerInstance {
+						// Evict oldest chain key to prevent DoS via chain-key grinding
+						var oldestKey gpbft.ECChainKey
+						var oldestTime time.Time
+						first := true
+						for ck := range pmkByChainKey {
+							if metaMap, ok := pmm.chainKeyMeta[inst]; ok {
+								if meta, ok := metaMap[ck]; ok {
+									if first || meta.firstSeen.Before(oldestTime) {
+										oldestKey = ck
+										oldestTime = meta.firstSeen
+										first = false
+									}
+									continue
+								}
+							}
+							// If no meta, pick this as oldest
+							oldestKey = ck
+							break
+						}
+						// Remove oldest
+						if keys, ok := pmkByChainKey[oldestKey]; ok {
+							for _, k := range keys {
+								buffer.Remove(k)
+								metrics.partialMessages.Add(ctx, -1)
+							}
+							delete(pmkByChainKey, oldestKey)
+							if metaMap, ok := pmm.chainKeyMeta[inst]; ok {
+								delete(metaMap, oldestKey)
+							}
+							log.Warnw("Evicted oldest chain key due to cap", "instance", inst, "evicted", oldestKey)
+						}
+					}
+					// Track first seen for new chain key
+					if _, ok := pmm.chainKeyMeta[inst]; !ok {
+						pmm.chainKeyMeta[inst] = make(map[gpbft.ECChainKey]*chainKeyMeta)
+					}
+					pmm.chainKeyMeta[inst][pgmsg.VoteValueKey] = &chainKeyMeta{
+						firstSeen: pmm.clk.Now(),
+					}
+				}
+
 				if known, found, _ := buffer.PeekOrAdd(key, pvgmsg); !found {
-					pmkByChainKey := pmm.pmkByInstanceByChainKey[pgmsg.Vote.Instance]
 					pmkByChainKey[pgmsg.VoteValueKey] = append(pmkByChainKey[pgmsg.VoteValueKey], key)
 					metrics.partialMessages.Add(ctx, 1)
+					// Increment sender count
+					if _, ok := pmm.senderCount[inst]; !ok {
+						pmm.senderCount[inst] = make(map[gpbft.ActorID]int)
+					}
+					pmm.senderCount[inst][sender]++
 				} else {
 					// The message is a duplicate. This can happen when a message is re-broadcasted.
 					// But the vote value key must remain consistent for the same instance, sender,
@@ -196,6 +345,9 @@ func (pmm *PartialMessageManager) Start(ctx context.Context) (<-chan gpbft.Parti
 				for i, pmsgs := range pmm.pmByInstance {
 					if i < instance {
 						delete(pmm.pmByInstance, i)
+						delete(pmm.pmkByInstanceByChainKey, i)
+						delete(pmm.chainKeyMeta, i)
+						delete(pmm.senderCount, i)
 						metrics.partialMessageInstances.Add(ctx, -1)
 						metrics.partialMessages.Add(ctx, -int64(pmsgs.Len()))
 					}
@@ -203,6 +355,16 @@ func (pmm *PartialMessageManager) Start(ctx context.Context) (<-chan gpbft.Parti
 				for i := range pmm.pmkByInstanceByChainKey {
 					if i < instance {
 						delete(pmm.pmkByInstanceByChainKey, i)
+					}
+				}
+				for i := range pmm.chainKeyMeta {
+					if i < instance {
+						delete(pmm.chainKeyMeta, i)
+					}
+				}
+				for i := range pmm.senderCount {
+					if i < instance {
+						delete(pmm.senderCount, i)
 					}
 				}
 				if err := pmm.chainex.RemoveChainsByInstance(ctx, instance); err != nil {
@@ -387,7 +549,26 @@ func (pmm *PartialMessageManager) getOrInitPartialMessageBuffer(instance uint64)
 	if _, ok := pmm.pmkByInstanceByChainKey[instance]; !ok {
 		pmm.pmkByInstanceByChainKey[instance] = make(map[gpbft.ECChainKey][]partialMessageKey)
 	}
+	if _, ok := pmm.chainKeyMeta[instance]; !ok {
+		pmm.chainKeyMeta[instance] = make(map[gpbft.ECChainKey]*chainKeyMeta)
+	}
+	if _, ok := pmm.senderCount[instance]; !ok {
+		pmm.senderCount[instance] = make(map[gpbft.ActorID]int)
+	}
 	return buffer
+}
+
+func (pmm *PartialMessageManager) getMinBufferedInstance() uint64 {
+	min := ^uint64(0)
+	for inst := range pmm.pmByInstance {
+		if inst < min {
+			min = inst
+		}
+	}
+	if min == ^uint64(0) {
+		return 0
+	}
+	return min
 }
 
 func (pmm *PartialMessageManager) CompleteMessage(ctx context.Context, pgmsg *gpbft.PartialGMessage) (*gpbft.GMessage, bool) {
@@ -402,6 +583,9 @@ func (pmm *PartialMessageManager) CompleteMessage(ctx context.Context, pgmsg *gp
 
 	chain, found := pmm.chainex.GetChainByInstance(ctx, pgmsg.Vote.Instance, pgmsg.VoteValueKey)
 	if !found {
+		// Chain not found yet: message will be buffered as partial.
+		// The vanish tracker in the main loop will eventually expire it if it never appears
+		// (fix for permanent lock via reorged deposits #93205).
 		return nil, false
 	}
 	pgmsg.Vote.Value = chain

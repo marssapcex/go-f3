@@ -29,6 +29,49 @@ type BroadcastMessage func(*gpbft.MessageBuilder)
 
 // gpbftRunner is responsible for running gpbft.Participant, taking in all concurrent events and
 // passing them to gpbft in a single thread.
+type peerRateLimiter struct {
+	mu      sync.Mutex
+	buckets map[peer.ID]*rateBucket
+	limit   int
+	window  time.Duration
+}
+
+type rateBucket struct {
+	count     int
+	windowEnd time.Time
+}
+
+func newPeerRateLimiter(limit int, window time.Duration) *peerRateLimiter {
+	if limit <= 0 {
+		return nil
+	}
+	return &peerRateLimiter{
+		buckets: make(map[peer.ID]*rateBucket),
+		limit:   limit,
+		window:  window,
+	}
+}
+
+func (rl *peerRateLimiter) allow(pid peer.ID) bool {
+	if rl == nil {
+		return true
+	}
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	now := time.Now()
+	b, ok := rl.buckets[pid]
+	if !ok || now.After(b.windowEnd) {
+		if len(rl.buckets) > 10000 {
+			// Prevent unbounded growth from peer ID spoofing
+			rl.buckets = make(map[peer.ID]*rateBucket)
+		}
+		rl.buckets[pid] = &rateBucket{count: 1, windowEnd: now.Add(rl.window)}
+		return true
+	}
+	b.count++
+	return b.count <= rl.limit
+}
+
 type gpbftRunner struct {
 	certStore   *certstore.Store
 	manifest    manifest.Manifest
@@ -56,6 +99,9 @@ type gpbftRunner struct {
 	inputs      gpbftInputs
 	msgEncoding encoding.EncodeDecoder[*gpbft.PartialGMessage]
 	pmm         *pmsg.PartialMessageManager
+
+	// rateLimiter prevents unauthenticated flooding (fix for LP #92900 anonymous cap bypass)
+	rateLimiter *peerRateLimiter
 }
 
 type roundPhase struct {
@@ -94,6 +140,9 @@ func newRunner(
 		equivFilter:  newEquivocationFilter(pID),
 		selfMessages: make(map[uint64]map[roundPhase][]*gpbft.GMessage),
 		inputs:       newInputs(m, cs, ec, verifier, clock.GetClock(ctx)),
+		// Rate limit: 100 messages per peer per minute to prevent flooding
+		// (analogous to LP fix: 20 accepts/minute per IP)
+		rateLimiter: newPeerRateLimiter(100, time.Minute),
 	}
 
 	// create a stopped timer to facilitate alerts requested from gpbft
@@ -540,11 +589,18 @@ func (h *gpbftRunner) rebroadcastMessage(msg *gpbft.GMessage) error {
 
 var _ pubsub.ValidatorEx = (*gpbftRunner)(nil).validatePubsubMessage
 
-func (h *gpbftRunner) validatePubsubMessage(ctx context.Context, _ peer.ID, msg *pubsub.Message) (_result pubsub.ValidationResult) {
+func (h *gpbftRunner) validatePubsubMessage(ctx context.Context, pid peer.ID, msg *pubsub.Message) (_result pubsub.ValidationResult) {
 	var partiallyValidated bool
 	defer func(start time.Time) {
 		recordValidationTime(ctx, start, _result, partiallyValidated)
 	}(time.Now())
+
+	// Rate limiting per peer to prevent unauthenticated flooding
+	// (fix for #92900: anonymous locking cap bypass leading to total DoS)
+	if !h.rateLimiter.allow(pid) {
+		log.Debugw("rate limit exceeded for peer", "peer", pid)
+		return pubsub.ValidationIgnore
+	}
 
 	var pgmsg gpbft.PartialGMessage
 	if err := h.msgEncoding.Decode(msg.Data, &pgmsg); err != nil {
