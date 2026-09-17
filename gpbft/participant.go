@@ -282,9 +282,10 @@ func (p *Participant) finishCurrentInstance() *Justification {
 
 func (p *Participant) beginNextInstance(nextInstance uint64) {
 	// Clean all messages queued and for instances below the next one.
+	// Use evictInstance to keep totalQueued accounting correct (fixes drift bug).
 	for inst := range p.mqueue.messages {
 		if inst < nextInstance {
-			delete(p.mqueue.messages, inst)
+			p.mqueue.evictInstance(inst)
 		}
 	}
 	// Clean committees from instances below the previous one. We keep the last committee so we

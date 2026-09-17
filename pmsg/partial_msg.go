@@ -144,6 +144,9 @@ func (pmm *PartialMessageManager) Start(ctx context.Context) (<-chan gpbft.Parti
 				now := pmm.clk.Now()
 				for inst, metaMap := range pmm.chainKeyMeta {
 					for ckey, meta := range metaMap {
+						// Increment miss count each tick to track vanished chains
+						// (analogous to LP deposit vanish tracker counting confirmations after bound)
+						meta.missCount++
 						if now.Sub(meta.firstSeen) > pmm.chainKeyExpiry {
 							// Expire vanished chain: remove all partial messages for this key
 							if pmk, ok := pmm.pmkByInstanceByChainKey[inst]; ok {
@@ -155,10 +158,18 @@ func (pmm *PartialMessageManager) Start(ctx context.Context) (<-chan gpbft.Parti
 										}
 									}
 									delete(pmk, ckey)
+									// Decrement sender counts for removed keys
+									for _, k := range keys {
+										if sc, ok := pmm.senderCount[inst]; ok {
+											if cnt, ok := sc[k.sender]; ok && cnt > 0 {
+												sc[k.sender] = cnt - 1
+											}
+										}
+									}
 								}
 							}
 							delete(metaMap, ckey)
-							log.Warnw("Expired vanished chain key (no discovery)", "instance", inst, "chainKey", ckey)
+							log.Warnw("Expired vanished chain key (no discovery)", "instance", inst, "chainKey", ckey, "missCount", meta.missCount)
 						} else if meta.missCount >= pmm.chainKeyVanishMissThreshold && now.Sub(meta.firstSeen) > pmm.chainKeyVanishDepth {
 							// Vanish tracker: chain wanted but never discovered, similar to LP deposit vanish
 							if pmk, ok := pmm.pmkByInstanceByChainKey[inst]; ok {
@@ -170,6 +181,13 @@ func (pmm *PartialMessageManager) Start(ctx context.Context) (<-chan gpbft.Parti
 										}
 									}
 									delete(pmk, ckey)
+									for _, k := range keys {
+										if sc, ok := pmm.senderCount[inst]; ok {
+											if cnt, ok := sc[k.sender]; ok && cnt > 0 {
+												sc[k.sender] = cnt - 1
+											}
+										}
+									}
 								}
 							}
 							delete(metaMap, ckey)
