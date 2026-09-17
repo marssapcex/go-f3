@@ -172,18 +172,15 @@ func (p *Participant) ReceiveMessage(ctx context.Context, vmsg ValidatedMessage)
 		return nil
 	}
 
-		// If the message is for the current instance, deliver immediately.
+	// If the message is for the current instance, deliver immediately.
 	if p.gpbft != nil && msg.Vote.Instance == currentInstance {
 		if err := p.gpbft.Receive(msg); err != nil {
 			return fmt.Errorf("%w: %w", ErrReceivedInternalError, err)
 		}
 		p.handleDecision(ctx)
 	} else {
-		// Otherwise queue it for a future instance, with DoS protection:
-		// don't allow messages too far in the future and enforce per-sender caps.
-		// This prevents an attacker from flooding the queue and starving honest messages,
-		// analogous to the powpeg-node 40-slot budget starvation.
-		p.mqueue.AddWithCurrentInstanceCheck(currentInstance, msg)
+		// Otherwise queue it for a future instance.
+		p.mqueue.Add(msg)
 	}
 	return nil
 }
@@ -282,10 +279,9 @@ func (p *Participant) finishCurrentInstance() *Justification {
 
 func (p *Participant) beginNextInstance(nextInstance uint64) {
 	// Clean all messages queued and for instances below the next one.
-	// Use evictInstance to keep totalQueued accounting correct (fixes drift bug).
 	for inst := range p.mqueue.messages {
 		if inst < nextInstance {
-			p.mqueue.evictInstance(inst)
+			delete(p.mqueue.messages, inst)
 		}
 	}
 	// Clean committees from instances below the previous one. We keep the last committee so we
@@ -321,158 +317,55 @@ func (p *Participant) trace(format string, args ...any) {
 
 // A collection of messages queued for delivery for a future instance.
 // The queue drops equivocations and unjustified messages beyond some round number.
-//
-// Security hardening (fix for retry-budget starvation similar to powpeg-node #93347):
-// - Limits future instance lookahead to prevent unbounded memory growth.
-// - Enforces per-instance and per-sender caps so a single sender cannot monopolise the queue.
-// - Uses fair, randomized draining to prevent hash-grinding from occupying the whole budget.
 type messageQueue struct {
 	maxRound uint64
 	// Maps instance -> sender -> messages.
 	// Note the relative order of messages is lost.
 	messages map[uint64]map[ActorID][]*GMessage
-
-	// Hardening limits
-	maxFutureInstances          uint64
-	maxMessagesPerInstance      int
-	maxMessagesPerSenderPerInst int
-	totalQueued                 int
-	maxTotalQueued              int
 }
 
 func newMessageQueue(maxRound uint64) *messageQueue {
 	return &messageQueue{
-		maxRound:                    maxRound,
-		messages:                    make(map[uint64]map[ActorID][]*GMessage),
-		maxFutureInstances:          10,   // don't queue too far in future
-		maxMessagesPerInstance:      1000, // cap per instance to bound memory
-		maxMessagesPerSenderPerInst: 50,   // prevent single sender from monopolising
-		maxTotalQueued:              5000, // global cap
+		maxRound: maxRound,
+		messages: make(map[uint64]map[ActorID][]*GMessage),
 	}
 }
 
-// Add queues a message for a future instance, with DoS protections.
-// The caller should have already checked that the instance is not in the past.
-// Returns true if the message was queued.
-func (q *messageQueue) Add(msg *GMessage) bool {
-	// Drop unjustified messages beyond some round limit.
-	if msg.Vote.Round > q.maxRound && isSpammable(msg) {
-		return false
-	}
-
-	// Enforce future instance lookahead: find the smallest queued instance as
-	// an approximation of current progress if caller didn't provide it.
-	// The definitive future check is done in ReceiveMessage which knows current instance.
-	// Here we just bound total number of distinct future instances.
-	if len(q.messages) > int(q.maxFutureInstances) {
-		// If we already track many future instances, only allow messages for
-		// already-tracked instances to avoid unbounded growth.
-		if _, ok := q.messages[msg.Vote.Instance]; !ok {
-			return false
-		}
-	}
-
-	if q.totalQueued >= q.maxTotalQueued {
-		// Global cap reached: evict oldest instance (smallest instance number) to make room,
-		// but do not accept new far-future instances beyond cap.
-		// This prevents memory exhaustion while keeping fairness.
-		var oldest uint64 = ^uint64(0)
-		for inst := range q.messages {
-			if inst < oldest {
-				oldest = inst
-			}
-		}
-		if oldest != ^uint64(0) && oldest != msg.Vote.Instance {
-			// Evict oldest to bound memory, but still enforce per-instance caps below
-			q.evictInstance(oldest)
-		} else if oldest == ^uint64(0) {
-			return false
-		}
-	}
-
+func (q *messageQueue) Add(msg *GMessage) {
 	instanceQueue, ok := q.messages[msg.Vote.Instance]
 	if !ok {
+		// There's no check on instance number being within a reasonable range here.
+		// It's assumed that spam messages for far future instances won't get this far.
 		instanceQueue = make(map[ActorID][]*GMessage)
 		q.messages[msg.Vote.Instance] = instanceQueue
 	}
-
-	// Per-instance cap
-	instanceCount := 0
-	for _, list := range instanceQueue {
-		instanceCount += len(list)
+	// Drop unjustified messages beyond some round limit.
+	if msg.Vote.Round > q.maxRound && isSpammable(msg) {
+		return
 	}
-	if instanceCount >= q.maxMessagesPerInstance {
-		return false
-	}
-
-	// Per-sender cap
-	if len(instanceQueue[msg.Sender]) >= q.maxMessagesPerSenderPerInst {
-		return false
-	}
-
 	// Drop equivocations and duplicates (messages with the same sender, round and phase).
 	for _, m := range instanceQueue[msg.Sender] {
 		if m.Vote.Round == msg.Vote.Round && m.Vote.Phase == msg.Vote.Phase {
-			return false
+			return
 		}
 	}
 	// Queue remaining good messages.
 	instanceQueue[msg.Sender] = append(instanceQueue[msg.Sender], msg)
-	q.totalQueued++
-	return true
-}
-
-func (q *messageQueue) evictInstance(inst uint64) {
-	if mq, ok := q.messages[inst]; ok {
-		for _, list := range mq {
-			q.totalQueued -= len(list)
-		}
-		delete(q.messages, inst)
-	}
-}
-
-// AddWithCurrentInstanceCheck adds a message only if its instance is within
-// [current, current+maxFutureInstances]. This is the preferred entry point from
-// Participant.ReceiveMessage where current progress is known.
-func (q *messageQueue) AddWithCurrentInstanceCheck(currentInstance uint64, msg *GMessage) bool {
-	if msg.Vote.Instance > currentInstance+q.maxFutureInstances {
-		return false
-	}
-	return q.Add(msg)
 }
 
 // Removes and returns all messages for an instance.
-// The returned messages are ordered by round and phase, but with fair
-// randomization across senders to prevent a single sender from monopolising
-// the budget (fix for hash-grinding starvation).
+// The returned messages are ordered by round and phase.
 func (q *messageQueue) Drain(instance uint64) []*GMessage {
-	instanceQueue, ok := q.messages[instance]
-	if !ok {
-		return nil
-	}
 	var msgs []*GMessage
-	for _, ms := range instanceQueue {
+	for _, ms := range q.messages[instance] {
 		msgs = append(msgs, ms...)
 	}
-	// Fairness: shuffle per-sender groups to avoid deterministic map iteration order
-	// being grindable (similar to ConcurrentHashMap bin order issue).
-	// We first sort by round/phase for correctness, then interleave by sender round-robin.
 	sort.SliceStable(msgs, func(i, j int) bool {
 		if msgs[i].Vote.Round != msgs[j].Vote.Round {
 			return msgs[i].Vote.Round < msgs[j].Vote.Round
 		}
-		if msgs[i].Vote.Phase != msgs[j].Vote.Phase {
-			return msgs[i].Vote.Phase < msgs[j].Vote.Phase
-		}
-		// Tie-break by sender to make ordering deterministic but not hash-grindable
-		return msgs[i].Sender < msgs[j].Sender
+		return msgs[i].Vote.Phase < msgs[j].Vote.Phase
 	})
-
-	// Count drained for totalQueued accounting
-	q.totalQueued -= len(msgs)
-	if q.totalQueued < 0 {
-		q.totalQueued = 0
-	}
 	delete(q.messages, instance)
 	return msgs
 }
