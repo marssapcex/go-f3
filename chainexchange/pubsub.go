@@ -260,6 +260,8 @@ func (p *PubSubChainExchange) validatePubSubMessage(ctx context.Context, _ peer.
 
 func (p *PubSubChainExchange) cacheAsDiscoveredChain(ctx context.Context, cmsg Message) {
 
+	// FIX: original code used getChainsDiscoveredAt for both wanted and discovered,
+	// which is a copy-paste bug. Wanted should come from wanted cache.
 	wanted := p.getChainsWantedAt(ctx, cmsg.Instance)
 	discovered := p.getChainsDiscoveredAt(ctx, cmsg.Instance)
 
@@ -281,8 +283,9 @@ func (p *PubSubChainExchange) cacheAsDiscoveredChain(ctx context.Context, cmsg M
 			}
 		} else if portion.IsPlaceholder() {
 			// It is a wanted key with a placeholder; replace the placeholder with the actual
-			// discovery and notify listener (fix for permanent lock: previously used
-			// discovered cache for both wanted/discovered, and never notified).
+			// discovery. Original code did not notify listener here, so partial messages
+			// buffered waiting for this chain would stay buffered until another
+			// GetChainByInstance call happens. We now notify.
 			wanted.Add(key, &chainPortion{
 				chain: prefix,
 			})
@@ -302,7 +305,6 @@ func (p *PubSubChainExchange) cacheAsDiscoveredChain(ctx context.Context, cmsg M
 		// been evicted from the cache or not. This should be cheap enough considering the
 		// added complexity of tracking evictions relative to chain prefixes.
 	}
-	// Notify listener outside of lock for placeholder replacements discovered via pubsub
 	if p.listener != nil {
 		for _, n := range notifications {
 			p.listener.NotifyChainDiscovered(ctx, n.instance, n.chain)
