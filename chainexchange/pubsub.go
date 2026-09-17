@@ -260,9 +260,10 @@ func (p *PubSubChainExchange) validatePubSubMessage(ctx context.Context, _ peer.
 
 func (p *PubSubChainExchange) cacheAsDiscoveredChain(ctx context.Context, cmsg Message) {
 
-	wanted := p.getChainsDiscoveredAt(ctx, cmsg.Instance)
+	wanted := p.getChainsWantedAt(ctx, cmsg.Instance)
 	discovered := p.getChainsDiscoveredAt(ctx, cmsg.Instance)
 
+	var notifications []discovery
 	allPrefixes := cmsg.Chain.AllPrefixes()
 	for i := len(allPrefixes) - 1; i >= 0 && ctx.Err() == nil; i-- {
 		prefix := allPrefixes[i]
@@ -280,12 +281,19 @@ func (p *PubSubChainExchange) cacheAsDiscoveredChain(ctx context.Context, cmsg M
 			}
 		} else if portion.IsPlaceholder() {
 			// It is a wanted key with a placeholder; replace the placeholder with the actual
-			// discovery.
+			// discovery and notify listener (fix for permanent lock: previously used
+			// discovered cache for both wanted/discovered, and never notified).
 			wanted.Add(key, &chainPortion{
 				chain: prefix,
 			})
 			metrics.chains.Add(ctx, 1, metric.WithAttributeSet(
 				attrFromWantedDiscovered(true, true)))
+			if p.listener != nil {
+				notifications = append(notifications, discovery{
+					instance: cmsg.Instance,
+					chain:    prefix,
+				})
+			}
 		}
 		// Nothing to do; the discovered value is already in the wanted chains with
 		// discovered value.
@@ -293,6 +301,13 @@ func (p *PubSubChainExchange) cacheAsDiscoveredChain(ctx context.Context, cmsg M
 		// Continue with the remaining prefix keys as we do not know if any of them have
 		// been evicted from the cache or not. This should be cheap enough considering the
 		// added complexity of tracking evictions relative to chain prefixes.
+	}
+	// Notify listener outside of lock for placeholder replacements discovered via pubsub
+	if p.listener != nil {
+		for _, n := range notifications {
+			p.listener.NotifyChainDiscovered(ctx, n.instance, n.chain)
+			metrics.notifications.Add(ctx, 1)
+		}
 	}
 }
 
