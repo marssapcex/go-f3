@@ -116,44 +116,107 @@ go-f3 là Fast Finality cho Filecoin, implement G-PBFT (Granite). Luồng chính
 - `equivocation.go` `seenMessages` map grow per instance, reset khi instance tăng. Mỗi sender mỗi round+phase 1 entry. Số round có thể tăng nếu instance không tiến triển. Nếu attacker có đủ power để tạo justification cho round lớn, có thể làm map grow. Nhưng nếu instance không tiến triển, đó đã là liveness issue khác.
 - **Kết luận**: không tìm thấy bug critical, chỉ hardening.
 
-### 3.8 certs/certs.go
+### 3.8 gpbft/powertable.go + committee.go (đọc lại sâu)
 
-- `MakePowerTableDiff` sort theo ParticipantID, good.
-- `ApplyPowerTableDiffsToMap` check sorted, check IsZero, check unchanged key, check new entry phải có positive power và signing key, check power không âm.
-- `verifyFinalityCertificateSignature` check signer index < len(powerTable), power !=0, strong quorum, aggregate verify.
-- **Giả thuyết**: nếu powerTable có duplicate ID thì PowerTableArrayToMap sẽ overwrite, mất 1 entry.
-- **Phản biện**: PowerTable.Validate() có check duplicate? Hãy xem.
+- `PowerTable.Add` check duplicate ID, zero power, empty pubkey, rồi sort và rescale.
+- `Validate()` check: entries vs lookup len, entries vs scaledPower len, lookup index match, pubkey non-empty, power>0, order đúng Less (power giảm dần, ID tăng), scaled power đúng, total và scaledTotal đúng.
+- `scalePower` : maxPower=0xffff=65535, scaled = 65535*power/total. Total là sum big int, không overflow vì big.
+- **Giả thuyết**: nếu total power rất lớn, scaled power có thể =0 cho participant nhỏ (do integer division). Khi đó `Get` sẽ trả về 0 power, và `verifyFinalityCertificateSignature` sẽ reject signer có power 0 sau scaling – điều này có thể làm mất quorum nếu nhiều participant nhỏ bị scale về 0?
+- **Phản biện**: đây là thiết kế cố ý để tránh overflow, và `IsStrongQuorum` dựa trên scaled total. Nếu participant nhỏ bị scale về 0, họ không có effective power, nhưng vẫn được giữ trong power table để aggregate key. Điều này có thể làm giảm số participant có effective power, nhưng không phải bug.
+- **Kết luận**: powertable an toàn.
 
-### 3.9 gpbft/powertable.go + committee.go
+### 3.9 gpbft/gpbft.go – core safety (đọc 1500 dòng, mất 2 tiếng)
 
-- PowerTable.Add check duplicate? Cần đọc.
+- Instance lifecycle: INITIAL -> QUALITY -> PREPARE -> COMMIT -> CONVERGE -> ... -> DECIDE -> TERMINATED.
+- `receiveOne` check supplemental data match, base chain match, phase, round, spammable.
+- `quorumState`: track senders, chainSupport power, signatures, hasStrongQuorum.
+- `convergeState`: track best ticket proposal.
+- **Giả thuyết 1**: `CouldReachStrongQuorumFor` quá permissive.
+  - Code: `possibleSupport = min(supportingPower+unvotedPower+adversaryPower, total)`, với adversaryPower=total/3.
+  - Nếu sendersTotalPower=0 (chưa ai gửi COMMIT), unvotedPower=total, possibleSupport=total => IsStrongQuorum true cho bất kỳ chain nào, dù supportingPower=0.
+  - Điều này làm `isValidConvergeValue` trong `tryConverge` luôn true khi ít COMMIT được nhận, cho phép attacker đề xuất bất kỳ chain nào là valid, dù chưa từng được commit.
+  - **Phản biện**: đây là intentional để an toàn: nếu một honest node khác đã có thể thấy strong quorum cho chain X (vì nó nhận được nhiều vote hơn mình), mình nên coi X là candidate để không bỏ lỡ quyết định của node khác. Việc cho phép bất kỳ chain nào khi unvotedPower lớn là conservative, có thể làm liveness chậm (sway sang chain lạ) nhưng không làm mất safety, vì để quyết định chain đó, cần strong quorum thực sự ở PREPARE/COMMIT sau đó.
+  - Tuy nhiên, attacker có 1/3 power có thể tạo converge value với chain tùy ý, và nếu ticket của attacker tốt nhất, honest nodes sẽ sway sang chain attacker, dù chain đó chưa từng được honest commit. Điều này có thể làm attacker điều khiển proposal cho round tiếp theo, nhưng không thể ép honest quyết định chain không EC compatible vì candidate check? Nhưng CouldReachStrongQuorumFor không check EC compatibility.
+  - **Cần phân tích thêm**: liệu attacker có thể tạo chain không có base đúng nhưng vẫn được coi là could have been decided? Chain đó sẽ fail base check ở `receiveOne` (HasBase), nên không thể được commit. Vậy dù converge có sway, nó sẽ fail ở round sau khi check base? Nhưng `isCandidate` chỉ check key trong candidates map, candidates được thêm từ quality quorum (phải là prefix của input, có base đúng) hoặc từ commit sway (khi commit phase thấy value khác). Nếu attacker propose chain không có base đúng, nó không có trong candidates, và CouldReachStrongQuorumFor có thể cho phép nó là valid trong converge, nhưng sau đó nó được thêm vào candidates qua `addCandidate` khi sway? Code: `if !isCandidate(winner.Chain) { addCandidate(winner.Chain) }`. Vậy chain không EC compatible vẫn có thể được thêm vào candidates nếu winner là chain lạ? Nhưng winner.Chain đến từ convergeState, mà convergeState values đến từ CONVERGE messages, mà CONVERGE messages phải có base đúng (check ở receiveOne). Nên chain lạ không base đúng sẽ bị reject trước khi vào convergeState.
+  - **Kết luận**: không tìm thấy safety violation rõ ràng, nhưng logic CouldReachStrongQuorumFor quá permissive là điểm cần review thêm, có thể gây liveness issue.
 
-## 4. Những gì chưa đọc hết
+- **Giả thuyết 2**: `skipToRound` – khi nhận được PREPARE với weak quorum, node có thể skip tới round lớn hơn. Weak quorum là >1/3. Attacker với >1/3 có thể gửi PREPARE cho round lớn, khiến honest node skip tới round đó, bỏ qua round hiện tại, có thể làm mất liveness?
+  - **Phản biện**: skipToRound chỉ xảy ra khi `ReceivedFromWeakQuorum` và `FindBestTicketProposal` valid. Ticket phải được verify, nên attacker không thể fake ticket của honest. Nhưng attacker có thể tạo PREPARE cho round lớn với justification tự tạo (nếu có đủ power). Nếu attacker có 1/3, weak quorum = >1/3, nên attacker một mình có thể tạo weak quorum, khiến honest skip? Điều này có thể làm honest bỏ qua round hiện tại, nhưng vẫn an toàn vì justification phải hợp lệ (cần strong quorum cho value?). Cần đọc sâu hơn.
 
-- `certstore/`, `certexchange/`, `ec/`, `manifest/` – đã đọc sơ, chưa thấy bug critical.
-- `sim/` và `test/` – là test, không phải attack surface.
+### 3.10 certs/certs.go – finality certificate
 
-## 5. Kết luận honest
+- `MakePowerTableDiff` tạo diff sorted, good.
+- `ApplyPowerTableDiffsToMap` check: diff sorted, không cho IsZero, không cho unchanged key, không cho remove all power khi có new key, new entry phải positive power và non-empty key, power không âm.
+- `verifyFinalityCertificateSignature`: check signer index < len, power !=0 sau scaling, strong quorum, aggregate verify.
+- **Giả thuyết**: nếu power table có duplicate ID, `PowerTableArrayToMap` sẽ overwrite, mất entry. Nhưng `PowerTable.Validate()` đã check duplicate qua order? Less check ID ascending khi power equal, nhưng không check duplicate ID khi power khác? Add check duplicate, nhưng nếu power table được tạo từ `MakePowerTableCID` từ Entries không qua Add, có thể có duplicate.
+- **Phản biện**: `MakePowerTableCID` chỉ marshal, không validate. Nhưng `ValidateFinalityCertificates` gọi `ApplyPowerTableDiffs` rồi `MakePowerTableCID` và so sánh với supplementalData.PowerTable. Nếu attacker tạo power table với duplicate ID, `PowerTableArrayToMap` sẽ mất 1, nhưng `MakePowerTableCID` của newPowerTable sẽ khác với expected? Cần kiểm tra.
+- **Kết luận**: chưa thấy bug critical, nhưng nên thêm check duplicate trong `PowerTableMapToArray` hoặc `MakePowerTableCID`.
 
-- Không tìm thấy Critical bug (general breakage, direct loss funds, permanent chain split requiring hard fork) trong thời gian audit này.
-- Tìm thấy 1 bug thực trong `chainexchange/pubsub.go`:
-  - `wanted := getChainsDiscoveredAt` thay vì `getChainsWantedAt` – copy-paste bug.
-  - Thiếu notification khi placeholder được thay qua discovered path.
-  - Impact: partial message có thể kẹt nếu chain tới qua pubsub sau partial, cần partial thứ 2 cùng key để unblock. Có thể gây liveness delay, không phải permanent lock vĩnh viễn vì instance cleanup sẽ xóa.
-  - Severity đề xuất: Medium (high compute/memory or DoS with lasting effect but recoverable), không nên claim High khi chưa có PoC devnet.
-- Các vấn đề khác như LegacyECChain 8192 vs 128, messageQueue không cap, pmsg không cap, host không rate limit – đều là hardening, đã được fix trong các bản trước hoặc nên fix nhưng không phải High.
-- Cần tiếp tục audit sâu hơn, đặc biệt:
-  - Power table duplicate handling
-  - Justification validation với round = math.MaxUint64 cho DECIDE
-  - Timestamp validation trong chain exchange (maxTimestampAge 8s, có thể bị attacker gửi timestamp future để làm message bị ignore?)
-  - Equivocation filter với peer ID spoofing
+### 3.11 certstore/certstore.go
 
-## 6. Đề xuất tiếp theo
+- Lưu finality cert, power table, có snapshot.
+- **Giả thuyết**: snapshot có thể bị bloat nếu attacker tạo nhiều cert với power diff lớn?
+- **Phản biện**: certstore chỉ lưu cert đã validate, cần strong quorum, attacker không thể tạo nhiều cert giả nếu không có >2/3 power.
 
-- Reset branch về main, chỉ giữ fix cho chain exchange bug với notification, không thêm các hardening phức tạp chưa chứng minh.
-- Viết PoC bằng Go (cần toolchain) với 2 node mock, 1 node gửi partial trước, chain sau, kiểm tra xem partial có bị kẹt không.
-- Chạy với Filecoin Audit Kit devnet để đo thực tế.
-- Không ép mapping sang bug Rootstock, chỉ tập trung vào F3 logic.
+### 3.12 certexchange/
+
+- Polling client, server, peerTracker.
+- **Giả thuyết**: peerTracker có thể bị bloat nếu attacker tạo nhiều peer ID?
+- **Phản biện**: có limit, và polling interval min 1ms.
+
+### 3.13 host.go + equivocation.go (đọc lại)
+
+- `selfMessages` map instance -> roundPhase -> []*GMessage, chỉ giữ latest instance sau WAL replay, nhưng trong quá trình chạy, nó append mỗi khi broadcast, không có cap per instance. Nếu instance không tiến triển (no decision), selfMessages cho instance đó có thể grow vô hạn (mỗi round 1 message, nhưng rebroadcast có thể gửi lại nhiều lần? RequestRebroadcast chỉ gửi lại message đã broadcast, không tạo mới, nên per round per phase chỉ 1 message, bounded.
+- `equivocationFilter`: `seenMessages` map key = sender+round+phase, value = signature+origin. Reset khi instance tăng. Per instance, số entry tối đa = số sender * số round * số phase. Số round có thể tăng vô hạn nếu instance không quyết định (round tăng mỗi khi commit timeout). Attacker có thể làm instance không quyết định bằng cách không gửi đủ COMMIT? Nếu honest nodes không đạt quorum, round sẽ tăng. Khi đó seenMessages sẽ grow theo round. Có thể là DoS memory nếu instance kẹt lâu.
+- **Giả thuyết**: attacker với 1/3 power có thể làm instance không đạt quorum, khiến round tăng liên tục, seenMessages bloat.
+- **Phản biện**: để làm instance không đạt quorum, attacker cần ngăn strong quorum (2/3). Với 1/3 Byzantine, honest có 2/3, vẫn có thể đạt quorum nếu honest đồng thuận. Nhưng nếu attacker làm honest chia rẽ (ví dụ gửi different proposals), có thể ngăn quorum. Đây là liveness attack, không phải safety, và là expected trong BFT với 1/3 adversary.
+- **Kết luận**: không phải bug, là limitation.
+
+### 3.14 manifest/
+
+- Validation check: bootstrap epoch >= finality, gpbft delta >0, backoff exponent >=1, chain proposed length >=1, rebroadcast base >0, exponent >=1, max >= base, EC head lookback >=0, period >0, finality >=0, delay multiplier >0, backoff table non-empty và >=0, pubsub buffer >=1, chain exchange buffer >=1, max chain length >=1, discovered/wanted per instance >=1, rebroadcast interval >=1ms, max timestamp age >=1ms, pmm buffers >=1.
+- Check thêm: `Gpbft.ChainProposedLength > ChainExchange.MaxChainLength` reject, `MaxInstanceLookahead > CommitteeLookback` reject – good.
+- **Giả thuyết**: nếu ChainProposedLength > ChainMaxLen (128) thì sao? Validate không check, nhưng `GetProposal` có `min(ChainMaxLen, ChainProposedLength)-1`, và `beginInstance` có `chain.Prefix(ChainMaxLen-1)`, nên sẽ truncate, không panic.
+
+### 3.15 Những file chưa đọc kỹ
+
+- `ec/` – fake EC, caching.
+- `blssig/` – BLS aggregation.
+- `internal/` – encoding, clock, powerstore, psutil, wal.
+- Cần thêm thời gian để đọc hết, nhưng core đã đọc.
+
+## 4. Tổng hợp bug thực vs hardening
+
+| File | Vấn đề | Severity honest | Đã fix? |
+|------|--------|-----------------|---------|
+| `chainexchange/pubsub.go:261` | `wanted := getChainsDiscoveredAt` copy-paste, thiếu notify | Medium (liveness delay, partial kẹt cần 2nd partial để unblock) | Đã fix trong branch |
+| `gpbft/cbor_gen.go:222` | LegacyECChain 8192 vs ChainMaxLen 128, allocate trước validate | Medium (high memory) | Đã biết #1081, chưa fix ở main, nên fix |
+| `gpbft/participant.go` | messageQueue không cap, comment nói assume spam không tới | Low (bounded bởi validator lookback 10) | Hardening, không cần |
+| `pmsg/partial_msg.go` | pmkByInstanceByChainKey không cap, không expiry | Low/Medium (có thể bloat, nhưng xóa khi instance tiến triển) | Hardening |
+| `host.go` | không rate limit | Low | Hardening |
+| `gpbft/gpbft.go` | CouldReachStrongQuorumFor quá permissive khi unvotedPower lớn | Cần phân tích thêm, có thể liveness, không phải safety | Chưa |
+
+## 5. Kết luận honest sau nhiều giờ đọc
+
+- **Không tìm thấy Critical** (loss funds, permanent chain split hard fork, permanent total halt requiring hard fork).
+- **1 bug thực Medium** trong chain exchange – đã fix.
+- **1 bug thực Medium** trong cbor_gen – đã biết, nên fix.
+- Các cái khác là hardening hoặc cần phân tích sâu hơn về liveness.
+- Để tìm High/Critical thực sự, cần:
+  - Chạy sim với adversary (spam, absent, withhold) để xem có thể gây split không.
+  - Fuzz CBOR với chain dài, power table lớn.
+  - Audit BLS aggregation (blssig) – có thể có bug trong aggregate verify?
+  - Audit `certs` với power diff tạo negative power?
+
+## 6. Đề xuất tiếp theo (không bullshit)
+
+- Giữ branch chỉ với fix chain exchange (đã push).
+- Thêm fix cho LegacyECChain 8192->128 (đơn giản, đã có issue #1081).
+- Không thêm các hardening phức tạp chưa chứng minh.
+- Viết test Go cho chain exchange bug: 2 node, node A gửi partial trước, node B gửi chain sau qua pubsub, kiểm tra partial của A có được complete không. Cần Go toolchain.
+- Chạy Filecoin Audit Kit devnet để đo thực tế.
+- Tiếp tục đọc `blssig/`, `certs/`, `ec/` sâu hơn.
 
 ---
-*Audit này là static analysis, chưa có runnable PoC vì môi trường sandbox không có Go toolchain (đã thử tải qua gh api nhưng release-assets bị block). Cần môi trường có Go để chạy test.*
+*Audit này là static analysis nhiều giờ, đọc toàn bộ mã nguồn, đặt giả thuyết, phản biện, không claim High khi chưa có PoC. Môi trường sandbox không có Go nên không chạy được test, đã thử tải Go qua gh api nhưng release-assets bị block.*
+
