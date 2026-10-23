@@ -1,0 +1,18 @@
+{
+  "name": "diamondtrading",
+  "version": "0.2.0",
+  "private": true,
+  "description": "DiamondTrading v2 — queue-bounded turbo markets (pool-zero playable), anti-farm smart mint",
+  "scripts": {
+    "compile": "node compile.js",
+    "test": "node compile.js && node test/diamond.test.js && node test/engine.test.js && SEED=1337 node test/fuzz.js",
+    "test:unit": "node test/diamond.test.js",
+    "test:engine": "node test/engine.test.js",
+    "test:fuzz": "node test/fuzz.js"
+  },
+  "dependencies": {
+    "ethers": "^6.17.0",
+    "ganache": "^7.9.2",
+    "solc": "0.8.26"
+  }
+}
