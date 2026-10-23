@@ -1,0 +1,17 @@
+{
+  "_comment": "V2 underlyer menu for DiamondHouse.classCfg. classId is the single source of truth shared by quoter (off-chain pricing), the attester set (settlement reference), and the on-chain class table. V2 has NO solvency gate: static lines are (a) per-ticket profit cap profitCap = max (M-1)*S in USDC(6dp), (b) queueDebt < QMAX. DYNAMIC G3 caps (ALGORITHM): P_max = min(k*lambda*omega, profitCap) measured live from routed-venue flow supersede the static cap whenever TIGHTER. Governance can only tighten caps after deploy.",
+  "_units": {
+    "maxMultX1e4": "multiplier * 1e4 (1000x = 10000000)",
+    "profitCap": "max profit (M-1)*S per ticket, USDC 6dp"
+  },
+  "classes": [
+    { "classId": 0, "asset": "BTC",  "hlMarket": "BTC-USDC",  "tier": "A", "maxMultX1e4": 10000000, "profitCap": 35000e6, "settleRef": "binance+hl dual-read", "notes": "price-discovery = Binance; HL print cross-check" },
+    { "classId": 1, "asset": "ETH",  "hlMarket": "ETH-USDC",  "tier": "A", "maxMultX1e4": 10000000, "profitCap": 25000e6, "settleRef": "binance+hl cross-check", "notes": "HL runner-up < 30% of Binance depth -> single-read Binance in practice" },
+    { "classId": 2, "asset": "SOL",  "hlMarket": "SOL-USDC",  "tier": "A", "maxMultX1e4": 10000000, "profitCap": 15000e6, "settleRef": "binance print", "notes": "Binance ~10x deeper than HL (23/10/2026 data): route Binance, no dual-read" },
+    { "classId": 3, "asset": "HYPE", "hlMarket": "HYPE-USDC", "tier": "A", "maxMultX1e4": 10000000, "profitCap": 15000e6, "settleRef": "hl print (home liquidity)", "notes": "volume near-parity but OI ~4-5x on HL; home BBO wins; first candidate for L1Read verifier" },
+    { "classId": 4, "asset": "BNB",  "hlMarket": null,        "tier": "B", "maxMultX1e4": 10000000, "profitCap": 8000e6,  "settleRef": "binance print", "notes": "no HL perp listing worth measuring" },
+    { "classId": 5, "asset": "SP500", "hlMarket": "xyz:SP500","tier": "B", "maxMultX1e4": 1000000,  "profitCap": 3000e6,  "settleRef": "hl print (only 24/7 venue)", "notes": "HIP-3 equity perp; 100x max; off-hours lambda collapse auto-tightens via G3; weekend sales haircut/halt in quoter" },
+    { "classId": 6, "asset": "XYZ100","hlMarket": "xyz:XYZ100","tier": "B", "maxMultX1e4": 1000000, "profitCap": 3000e6,  "settleRef": "hl print (only 24/7 venue)", "notes": "HIP-3 NASDAQ 100 perp; 100x max; same off-hours rule as SP500" }
+  ],
+  "rm": "removed classes from v1 menu: XRP/DOGE/ZEC (watchlist only, re-admit on measured depth)"
+}
