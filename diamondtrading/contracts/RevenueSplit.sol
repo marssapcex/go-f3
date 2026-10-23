@@ -7,15 +7,15 @@ interface IERC20MinR {
     function balanceOf(address a) external view returns (uint256);
 }
 
-/// @title RevenueSplit — EDGE staking pool receiving the stakers' share of REALIZED
-/// positive edge in USDC. Cash-basis only: the house pushes USDC in via notifyRevenue();
+/// @title RevenueSplit — DIAMOND staking pool receiving the stakers' share of REALIZED
+/// positive diamond in USDC. Cash-basis only: the house pushes USDC in via notifyRevenue();
 /// nothing here is ever read INTO the house's solvency accounting (one-directional flow,
 /// audit lesson H-01/H-02/KV-06: no cross-domain cursors).
 /// Weekly netting semantics are implemented by the pusher (house treasury only pushes on
 /// net-positive weeks, loss weeks carry forward off-chain).
 contract RevenueSplit {
     IERC20MinR public immutable usdc;
-    IERC20MinR public immutable edge;
+    IERC20MinR public immutable diamond;
     address public owner;
     address public house;           // only house may push revenue
 
@@ -24,7 +24,7 @@ contract RevenueSplit {
     uint256 public totalStaked;
     mapping(address => uint256) public staked;
 
-    // reward accrual index (1e18-scaled USDC per 1 EDGE staked)
+    // reward accrual index (1e18-scaled USDC per 1 DIAMOND staked)
     uint256 public rewardIndex;
     mapping(address => uint256) public userIndex;
 
@@ -42,9 +42,9 @@ contract RevenueSplit {
     event RewardClaimed(address indexed who, uint256 amount);
     event HouseSet(address indexed house);
 
-    constructor(address _usdc, address _edge) {
+    constructor(address _usdc, address _diamond) {
         usdc = IERC20MinR(_usdc);
-        edge = IERC20MinR(_edge);
+        diamond = IERC20MinR(_diamond);
         owner = msg.sender;
     }
 
@@ -52,7 +52,7 @@ contract RevenueSplit {
 
     function stake(uint256 amount) external nonReentrant {
         _settleReward(msg.sender);
-        require(edge.transferFrom(msg.sender, address(this), amount), "pay");
+        require(diamond.transferFrom(msg.sender, address(this), amount), "pay");
         staked[msg.sender] += amount;
         totalStaked += amount;
         emit Staked(msg.sender, amount);
@@ -74,7 +74,7 @@ contract RevenueSplit {
         require(u.amount > 0 && block.timestamp >= u.availableAt, "not ready");
         uint256 amt = u.amount;
         delete unbonding[msg.sender];
-        require(edge.transfer(msg.sender, amt), "edge out");
+        require(diamond.transfer(msg.sender, amt), "diamond out");
         emit Withdrawn(msg.sender, amt);
     }
 

@@ -1,18 +1,19 @@
-// DiamondTrading v2 scenario tests — the 6 mandatory groups from the v2 spec.
+// DiamondTrading v3 scenario tests — transparent FIFO queue, no brake, no pause.
 //   [Q1] pool=0 core: whale wins > pool → exact FIFO debt, stake-back-first, harvest,
-//        inline-4, no cut-in-line, losses feed sideBucket→queue, fee lanes.
-//   [FARM] hedged pair caps mint at r(e)×fees.
-//   [MINT] pool=0 still mints; r(e) schedule; absolute epoch cap; sig rules.
-//   [SETTLE] settle-once, refund/settle double-play, time pins, attester quorum floor.
+//        inline-4, no cut-in-line, claimInfo() user-facing queue transparency.
+//   [SALES] buy at pool=0 works REGARDLESS of outstanding debt (v3: no QMAX), no pause.
+//   [MINT] pool=0 still mints; counter-cyclical adaptive rate (growth siết, yếu nới);
+//        absolute epoch cap; sig rules; DiamondToken bootstrap guard + one-way enable.
+//   [FARM] hedged pair caps mint at rate×fees.
 //   [REV]  distribution locked while queue>0 or pool ≤ target; 80% rule; exact pull.
-//   [SALES] buy at pool=0 works (the v2 point), QMAX brake, class profit cap, quote rules.
-// Invariant checked after every mutating call: lanesIntact() == true (B == pool+side+openStakes).
+//   [SETTLE] settle-once, refund/settle double-play, time pins, attester quorum floor.
+// Invariant checked after every mutating call: lanesIntact() == true (B == pool+openStakes).
 const { ethers } = require("ethers");
 const ganache = require("ganache");
 const fs = require("fs");
 const path = require("path");
 const { Quoter, Attester } = require("../engine/quoter.js");
-const { EpochLedger, buildMerkle, signRevenueAnchor, rateBps } = require("../engine/ledger.js");
+const { EpochLedger, buildMerkle, signRevenueAnchor, projectedRate, LAUNCH_RATE_BPS } = require("../engine/ledger.js");
 
 const U = (n) => BigInt(n) * 10n ** 6n;
 const x = (n) => BigInt(Math.round(n * 1e4));
@@ -87,7 +88,7 @@ async function main() {
   const netProfit = (S, M) => { const p = S * (BigInt(Math.round(M * 1e4)) - 10_000n) / 10_000n; return { p, fee: p * 200n / 10_000n, net: p - p * 200n / 10_000n }; };
 
   // ============ [SALES] v2 point: pool=0 playable + brakes ============
-  console.log("\n[SALES] pool=0 sales, QMAX brake, class caps, quote rules");
+  console.log("\n[SALES] pool=0 sales, no QMAX (v3), no pause switch, class caps, quote rules");
   {
     ok(await house.pool() === 0n, "pool starts at 0");
     const id0 = await buyTicket(b1, 100, 50);        // profit 4900 > pool=0 — SALE STILL WORKS
@@ -112,39 +113,35 @@ async function main() {
     await expectRevert(H(b2).buyTicket(r4v.q, r4v.sig, x(50), 60), "quote bound to buyer", "bad quote sig|quote not yours");
     const r5v = await qTicket(b1, 100, 50);
     await expectRevert(H(b1).buyTicket(r5v.q, r5v.sig, x(60), 60), "slippage bound enforced", "slippage");
-    // pause: sales blocked, settlement not
-    await (await H(owner).pauseSales(true)).wait();
-    const r6v = await qTicket(b1, 100, 50);
-    await expectRevert(H(b1).buyTicket(r6v.q, r6v.sig, x(50), 60), "paused sales rejected", "sales halted");
-    await (await H(owner).pauseSales(false)).wait();
-    // QMAX brake
-    await (await H(owner).setMaxQueueDebt(U(8_000))).wait();
-    // create 3 winning tickets at low mult so their profits are paid from a tiny pool
+    // v3: no pause function exists on the contract at all
+    ok(house.pauseSales === undefined, "no pauseSales — house cannot freeze (permissionless by design)");
+    // create queue debt: LP-seeded tiny pool, whale win
     await (await H(b1).lpDeposit(U(1_000))).wait();      // pool=1000
     await lanes("after LP deposit");
-    const q1 = await buyTicket(b2, 100, 50);             // profit 4900, pool 1000 → queue 4127
+    const q1 = await buyTicket(b2, 100, 50);             // profit 4900, pool 1000 → queue rest
     const s0 = await sigh(q1, 1);
     await settleRaw(q1, 1, s0);
     const debt1 = await house.queueDebt();
-    // b2 $100 @ 50x: profit 4900, fee 98, net 4802; pool 1000 pays 1000 → queue 3802; fee→sideBucket 98
+    // b2 $100 @ 50x: profit 4900, fee 98, net 4802; pool 1000 pays 1000 → queue 3802
     ok(debt1 === U(3_802), "whale win queues exact shortfall 3802 (net 4802 − pool 1000)");
-    ok((await house.sideBucket()) === 0n, "fee is a claim haircut, no cash lane (ρ never conjures cash)");
+    ok((await house.pool()) === 0n, "pool spent first; fee is a claim haircut, no cash lane");
     await lanes("after queued win");
     const r7v = await qTicket(b3, 10, 50);
     const canBuyInDebt = await H(b3).buyTicket(r7v.q, r7v.sig, x(50), 60).then((t) => t.wait()).then(() => true).catch(() => false);
-    ok(canBuyInDebt, "sales continue below QMAX while queue has debt");
-    // b3's losing ticket (id 2): stake 10 → sideBucket 108 → inline pays 108 of the queue
+    ok(canBuyInDebt, "sales continue while queue has debt (v3: no QMAX brake)");
+    // b3's losing ticket (id 2): stake 10 → pool 10 → inline pays 10 of the queue
     const debtPreB3 = await house.queueDebt();
     await settleRaw(2n, 2, await sigh(2n, 2));
-    ok(debtPreB3 - (await house.queueDebt()) === U(10), "inline harvest paid the lost stake (10) into FIFO");
-    await (await H(owner).setMaxQueueDebt(U(1))).wait();         // QMAX below debt → sales stop
-    const r8v = await qTicket(b3, 10, 50);
-    await expectRevert(H(b3).buyTicket(r8v.q, r8v.sig, x(50), 60), "QMAX brake halts sales", "queue saturated");
-    await (await H(owner).setMaxQueueDebt(U(1_000_000))).wait(); // restore
+    ok(debtPreB3 - (await house.queueDebt()) === U(10), "inline harvest paid the lost stake (10) into FIFO from pool");
+    // claimInfo: user can read own queue position + owed amount (frontend only notifies when hasDebt)
+    const ci = await house.claimInfo(q1);
+    ok(ci.hasDebt && ci.position === 1n && ci.amountOwed === U(3_802) - U(10), "claimInfo: whale is #1 in line, owed 3792 post-inline");
+    const ci2 = await house.claimInfo(2n);
+    ok(!ci2.hasDebt && ci2.amountOwed === 0n && ci2.totalDebt > 0n, "claimInfo: loser ticket has no debt but sees total house debt");
   }
 
   // ============ [Q1] pool=0 whale, FIFO, harvest, cut-in-line ============
-  console.log("\n[Q1] pool≈0: exact debt, FIFO, harvest(n), inline-4, no cut-in-line, sweep");
+  console.log("\n[Q1] pool≈0: exact debt, FIFO, harvest(n), inline-4, no cut-in-line, claimInfo");
   {
     // deploy a FRESH house for a clean queue experiment
     const h2 = await (await C("DiamondHouse", owner).deploy(await usdc.getAddress(), quoterW.address)).waitForDeployment();
@@ -175,9 +172,12 @@ async function main() {
     const w1v = np(1_000, 20);
     ok((await h2.queueDebt()) === w1v.net - U(1_000), `queued shortfall exact = ${w1v.net - U(1_000)}`);
     ok((await usdc.balanceOf(b1.address)) === b1_0 + U(1_000) + U(1_000), "stake back + pool-covered slice instantly");
-    ok((await h2.sideBucket()) === 0n, "fee never books a cash lane (harvest-cash comes from losses only)");
-    ok((await h2.pool()) === 0n, "pool fully spent on the whale");
+    ok((await h2.pool()) === 0n, "pool fully spent on the whale (fee never books a cash lane)");
     ok(await h2.lanesIntact(), "lanes after whale");
+    // claimInfo (user-facing transparency): whale queued #1, owed exactly the shortfall
+    const cw = await h2.claimInfo(w1);
+    ok(cw.hasDebt && cw.position === 1n && cw.amountOwed === w1v.net - U(1_000),
+       "claimInfo: whale sees itself #1 in line, exact amount, totalDebt");
 
     // (2) four small winners b2 $100 @ 5x while in debt: FULL net profit queues (no cut-in-line)
     let debt = w1v.net - U(1_000);
@@ -192,22 +192,24 @@ async function main() {
       w2ids.push(id);
     }
     ok((await h2.queueDebt()) === debt, "four in-debt wins fully queued behind the whale");
-    ok((await h2.sideBucket()) === 0n, "fees never pool into sideBucket (claim haircut model)");
+    const cb2 = await h2.claimInfo(w2ids[0]);
+    ok(cb2.hasDebt && cb2.position === 2n && cb2.amountOwed === (x(5) - 10_000n) * U(100) / 10_000n * 98n / 100n,
+       "claimInfo: first small winner is #2, full net queued");
     ok(await h2.lanesIntact(), "lanes after in-debt wins");
 
     // FIFO head = oldest entry (the whale)
     ok((await h2.payoutQueue(await h2.queueHead())).owner === b1.address, "FIFO head is the oldest winner");
 
-    // (3) b3 loses 1,000 → SB 1,000; inline pays whale exactly 1,000
+    // (3) b3 loses 1,000 → pool 1,000; inline pays whale exactly 1,000 (papertrade rule)
     const l1 = await buy2(b3, 1_000, 2);
     await (await H2(relayer).settleWithProof(l1, 2, await sigh2(l1, 2))).wait();
     debt -= U(1_000);
-    ok((await h2.queueDebt()) === debt, "inline-4 paid oldest entry from sideBucket (debt −1,000)");
-    ok((await h2.sideBucket()) === 0n, "sideBucket drained by inline harvest");
+    ok((await h2.queueDebt()) === debt, "inline-4 paid oldest entry from pool (debt −1,000)");
+    ok((await h2.pool()) === 0n, "loser cash went straight to the queue (pool drained by inline harvest)");
     const d0 = await h2.queueDebt();
     await expectRevert(H2(b4).harvest(65), "harvest n > 64 rejected", "n bounds");
-    await (await H2(b4).harvest(2)).wait();             // empty sideBucket → no-op
-    ok((await h2.queueDebt()) === d0, "harvest with empty sideBucket is a no-op");
+    await (await H2(b4).harvest(2)).wait();             // empty pool → no-op
+    ok((await h2.queueDebt()) === d0, "harvest with empty pool is a no-op");
 
     // (4) b4 loses 17,000 → inline: whale done (16,620), then e1 12 remaining 380 → e1 left 12
     const l2 = await buy2(b4, 17_000, 2);
@@ -221,13 +223,14 @@ async function main() {
     debt -= U(1_000);
     ok((await h2.queueDebt()) === debt, "inline-4 capped at 4 entries; one queue stub remains (188)");
 
-    // (6) b4 loses 200 → pays stub 188, debt 0, sweep 12 → pool
+    // (6) b4 loses 200 → pool 200 → pays stub 188; queue clean, pool keeps the leftover 12
     const l4x = await buy2(b4, 200, 2);
     await (await H2(relayer).settleWithProof(l4x, 2, await sigh2(l4x, 2))).wait();
     ok((await h2.queueDebt()) === 0n, "queue fully cleared by 200-loss");
-    ok((await h2.pool()) === U(12), "sweep moved leftover 12 to pool");
-    ok((await h2.sideBucket()) === 0n, "sideBucket swept clean");
-    ok(await h2.lanesIntact(), "lanes after clear+sweep");
+    ok((await h2.pool()) === U(12), "leftover 12 stays in pool (v3: no sweep step)");
+    const cwDone = await h2.claimInfo(w1);
+    ok(!cwDone.hasDebt && cwDone.amountOwed === 0n, "claimInfo: whale fully paid, nothing reported");
+    ok(await h2.lanesIntact(), "lanes after queue clear");
 
     // exact player totals
     const b1Tot = await usdc.balanceOf(b1.address);
@@ -238,12 +241,11 @@ async function main() {
     await expectRevert(H2(relayer).settleWithProof(w1, 2, await sigh2(w1, 2)), "double settle rejected", "settled");
     await expectRevert(H2(b1).refundAfterStall(w1), "refund after settle rejected", "settled");
 
-    // (7) loss while queue clean → straight to pool (skip sideBucket entirely)
+    // (7) loss while queue clean → straight to pool
     const poolB = await h2.pool();
     const l4 = await buy2(b3, 100, 2);
     await (await H2(relayer).settleWithProof(l4, 2, await sigh2(l4, 2))).wait();
     ok((await h2.pool()) === poolB + U(100), "clean-queue loss becomes pool money directly (12+100)");
-    ok((await h2.sideBucket()) === 0n, "no sideBucket detour when queue clean");
 
     // (8) stall refund + settle-after-refund + EXPIRED pins
     const l5 = await buy2(b3, 100, 2, 30);
@@ -264,17 +266,25 @@ async function main() {
   }
 
   // ============ [MINT] pool=0 mint, r(e) schedule, absolute cap, sig ============
-  console.log("\n[MINT] pool=0 mints, r(e) decay, absolute cap, anchor+price sig");
+  console.log("\n[MINT] pool=0 mints, counter-cyclical adaptive rate, absolute cap, anchor+price sig");
   {
-    const edge = await (await C("EdgeToken", owner).deploy()).waitForDeployment();
-    const dist = await (await C("EdgeDistributor", owner).deploy(await edge.getAddress())).waitForDeployment();
-    await (await edge.setMinter(await dist.getAddress())).wait();
+    const diamond = await (await C("DiamondToken", owner).deploy()).waitForDeployment();
+    const dist = await (await C("DiamondDistributor", owner).deploy(await diamond.getAddress())).waitForDeployment();
+    await (await diamond.setMinter(await dist.getAddress())).wait();
     await (await dist.setBudgetAttester(budgeter.address)).wait();
 
-    ok(rateBps(0) === 20000, "r(0) = 200%");
-    ok(rateBps(180) === 20000 - Math.floor(17000 * 180 / 360), "r(180) halfway ≈115%");
-    ok(rateBps(360) === 3000 && rateBps(720) === 3000, "r(≥360) pinned at 30% floor");
-    ok((await dist.rateBps(0)) === 20000n && (await dist.rateBps(360)) === 3000n, "contract schedule mirrors engine");
+    // adaptive rate (v3): launch 200% bait; growth siết −250/epoch; yếu nới +1000/epoch
+    ok(LAUNCH_RATE_BPS === 20000, "launch rate constant 200%");
+    ok(projectedRate(20000, 0n, 0n) === 20000, "epoch 1 keeps launch rate (no prior anchor)");
+    ok(projectedRate(20000, 100n, 200n) === 19750, "growth epoch tightens −250bps off 200%");
+    ok(projectedRate(20000, 200n, 100n) === 20000, "weak epoch eases +1000bps, capped at ceiling");
+    ok(projectedRate(4_000, 100n, 200n) === 3_750, "tightening continues mid-range");
+    ok(projectedRate(3_100, 100n, 200n) === 3_000, "tightening pins at 30% floor");
+    ok(projectedRate(19_000, 200n, 100n) === 20_000, "easing never exceeds 200% ceiling");
+    ok((await dist.rateBps()) === 20_000n, "contract boots at 200%");
+    ok((await dist.projectedRateBps(U(1_000))) === 20_000n, "epoch-1 projection keeps bait rate");
+    ok((await dist.budgetFor(U(1_000), 5_000_000n)) === U(1_000) * 20_000n / 10_000n * 10n ** 20n / 5_000_000n,
+       "budgetFor = 200% × anchor ÷ price at launch");
 
     const L = new EpochLedger({ epochMs: 6 * 3600 * 1000 });
     L.add({ owner: b1.address, ts: 10, stake: U(1_000), payout: 0n, feePaid: U(30) });
@@ -298,32 +308,48 @@ async function main() {
 
     // absolute epoch cap binds
     const huge = L.mintAmounts(0, { priceX1e8: 1n });   // absurd price → astronomical budget
-    ok(huge.budget === 2_000_000n * 10n ** 18n, "absolute epoch cap binds at 2M EDGE");
+    ok(huge.budget === 2_000_000n * 10n ** 18n, "absolute epoch cap binds at 2M DIAMOND");
 
     // on-chain post with correct sig
     const sig = await signRevenueAnchor(budgeter, 1n, mm.anchor, PRICE01);
     const mk = buildMerkle(1, mm.amounts);
     await (await dist.postEpoch(1, mk.root, mm.total, mm.anchor, PRICE01, sig)).wait();
-    ok(true, "epoch posts with (anchor, price) attestation");
+    ok(true, "epoch-1 posts with (anchor, price) attestation");
+    ok((await dist.rateBps()) === 20_000n, "rate still 200% after epoch-1 (bait phase intact)");
+
+    // adaptive reaction on-chain: epoch 2 with FEWER fees (weaker anchor)... epoch-1 anchor = 10,520e6
+    const weakAnchor = mm.anchor - U(4_000);
+    const weakSig = await signRevenueAnchor(budgeter, 2n, weakAnchor, PRICE01);
+    await (await dist.postEpoch(2, ethers.hexlify(ethers.randomBytes(32)), 0n, weakAnchor, PRICE01, weakSig)).wait();
+    ok((await dist.rateBps()) === 20_000n, "weak anchor eases +1000, clamped at the 200% ceiling");
+    const bigAnchor = mm.anchor + U(4_000);
+    const bigSig = await signRevenueAnchor(budgeter, 3n, bigAnchor, PRICE01);
+    await (await dist.postEpoch(3, ethers.hexlify(ethers.randomBytes(32)), 0n, bigAnchor, PRICE01, bigSig)).wait();
+    ok((await dist.rateBps()) === 19750n, "growth anchor siết −250 → 197.5%");
+    const big2Sig = await signRevenueAnchor(budgeter, 4n, bigAnchor + U(4_000), PRICE01);
+    await (await dist.postEpoch(4, ethers.hexlify(ethers.randomBytes(32)), 0n, bigAnchor + U(4_000), PRICE01, big2Sig)).wait();
+    ok((await dist.rateBps()) === 19500n, "sustained growth grinds −250 more → 195%");
     await expectRevert(dist.postEpoch(2, mk.root, mm.total + 1n, mm.anchor, PRICE01, sig),
         "reused/mismatched anchor sig rejected", "");
     // claim
     await (await dist.connect(b1).claim(1, mm.amounts.get(b1.address), mk.proofOf(b1.address))).wait();
-    ok((await edge.balanceOf(b1.address)) === mm.amounts.get(b1.address), "net loser claims EDGE on-chain");
+    ok((await diamond.balanceOf(b1.address)) === mm.amounts.get(b1.address), "net loser claims DIAMOND on-chain");
+    ok((await diamond.symbol()) === "DIAMOND" && (await diamond.name()) === "DiamondToken",
+       "token is DIAMOND / DiamondToken");
 
     // bootstrap transfer guard: locked p2p transfer, allowlisted protocol moves, one-way unluck
-    await expectRevert(edge.connect(b1).transfer(b2.address, 1n), "p2p transfer locked in bootstrap", "transfers locked");
-    await (await edge.setTransferAllowlist(await dist.getAddress(), true)).wait();
+    await expectRevert(diamond.connect(b1).transfer(b2.address, 1n), "p2p transfer locked in bootstrap", "transfers locked");
+    await (await diamond.setTransferAllowlist(await dist.getAddress(), true)).wait();
     ok(true, "allowlist settable");
-    await expectRevert(edge.connect(b1).transfer(b2.address, 1n), "still locked without allowlisted peer", "transfers locked");
-    await (await edge.enableTransfers()).wait();
-    const e1 = await edge.balanceOf(b1.address);
+    await expectRevert(diamond.connect(b1).transfer(b2.address, 1n), "still locked without allowlisted peer", "transfers locked");
+    await (await diamond.enableTransfers()).wait();
+    const e1 = await diamond.balanceOf(b1.address);
     // NOTE: ganache eth_estimateGas can evaluate against a stale pending state after heavy
     // manual warp storms (estimate said "transfers locked" while real execution succeeds);
     // explicit gasLimit is used here to skip the mis-estimation — contract-side, probe6 verifies
     // all four guard cases green on the final bytecode.
-    await (await edge.connect(b1).transfer(b2.address, 1n, { gasLimit: 300_000 })).wait();
-    ok((await edge.balanceOf(b1.address)) === e1 - 1n, "transfers work after one-way enable");
+    await (await diamond.connect(b1).transfer(b2.address, 1n, { gasLimit: 300_000 })).wait();
+    ok((await diamond.balanceOf(b1.address)) === e1 - 1n, "transfers work after one-way enable");
 
     // LP vault: deposit at pool=0 (1:1), 7d exit lock, NAV slice withdrawal
     await (await H(lp1).lpDeposit(U(2_000))).wait();
@@ -338,7 +364,7 @@ async function main() {
   }
 
   // ============ [FARM] hedged long/short pair ============
-  console.log("\n[FARM] hedge pair: combined mint ≤ r(e) × fees the pair paid");
+  console.log("\n[FARM] hedge pair: combined mint ≤ rate × fees the pair paid");
   {
     const L = new EpochLedger({ epochMs: 6 * 3600 * 1000 });
     // wallet A long: wins big; wallet B short: loses the same notional — net pair P&L ≈ 0
@@ -351,7 +377,7 @@ async function main() {
         "budget anchored to fees+edge only: hedgers fund their own ceiling");
     ok(pairMint <= mm.budget, "pair mint ≤ budget anchored on its own fees+edge");
     const usdValueOfMint = pairMint * PRICE01 / 10n ** 20n;
-    ok(Number(usdValueOfMint) <= Number(mm.anchor) * 2, "mint value ≤ 2× anchor at r(0)=200%");
+    ok(Number(usdValueOfMint) <= Number(mm.anchor) * 2, "mint value ≤ 2× anchor at launch rate 200%");
   }
 
   // ============ [REV] distribution gate + waterfall ============
@@ -375,8 +401,8 @@ async function main() {
       const rc = await (await H3(who).buyTicket(r.q, r.sig, x(m), 60)).wait();
       return rc.logs.find((l) => l.fragment?.name === "Sold").args[0];
     };
-    const edge3 = await (await C("EdgeToken", owner).deploy()).waitForDeployment();
-    const sink3 = await (await C("RevenueSplit", owner).deploy(await usdc.getAddress(), await edge3.getAddress())).waitForDeployment();
+    const diamond3 = await (await C("DiamondToken", owner).deploy()).waitForDeployment();
+    const sink3 = await (await C("RevenueSplit", owner).deploy(await usdc.getAddress(), await diamond3.getAddress())).waitForDeployment();
     await (await h3.setRevenueSink(await sink3.getAddress())).wait();
     await (await sink3.setHouse(h3Addr)).wait();
     await (await h3.setTargetPool(U(500_000))).wait();
@@ -426,7 +452,7 @@ async function main() {
     await ok(await house.lanesIntact(), "lanes intact end of [SETTLE]");
   }
 
-  console.log(`\n==== diamond v2: ${pass} passed, ${fail} failed ====`);
+  console.log(`\n==== diamond v3: ${pass} passed, ${fail} failed ====`);
   process.exit(fail === 0 ? 0 : 1);
 }
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # DiamondTrading whitepaper builder.
 # deps: pip install matplotlib reportlab   (fonts: DejaVu Serif, bundled with matplotlib)
-# run:  python build.py  ->  DiamondTrading_v0.2.pdf (+ figures/*.png)
+# run:  python build.py  ->  DiamondTrading_v0.3.pdf (+ figures/*.png)
 import os, io, math
 import matplotlib
 matplotlib.use("Agg")
@@ -82,10 +82,10 @@ box(0.02, 0.70, 0.17, 0.22, "player / LP\n(USDC)")
 box(0.28, 0.70, 0.20, 0.22, "quoter (G4 σ, G3 caps,\nρ=2%)  EIP-712")
 box(0.57, 0.70, 0.19, 0.22, "attesters 2-of-3\n(G2 TWAP, G8 tol)")
 box(0.80, 0.70, 0.18, 0.22, "venues:\nBinance · Hyperliquid")
-box(0.24, 0.16, 0.24, 0.30, "DiamondHouse\ntickets 1.05x-1000x\nFIFO queue + QMAX")
-box(0.52, 0.16, 0.24, 0.30, "DiamondOptions\n25x capped ramps\nqueue-bounded, attested px")
-box(0.02, 0.02, 0.18, 0.20, "EdgeDistributor\nsmart mint v3\nr(e): 200%→30%")
-box(0.80, 0.02, 0.18, 0.20, "RevenueSplit\nEDGE stakers\nrev-share")
+box(0.24, 0.16, 0.24, 0.30, "DiamondHouse\ntickets 1.05x-1000x\nFIFO queue, no brake")
+box(0.52, 0.16, 0.24, 0.30, "DiamondOptions\n25x capped ramps\nattested px, FIFO")
+box(0.02, 0.02, 0.18, 0.20, "DiamondDistributor\nDIAMOND smart mint\nadaptive rate")
+box(0.80, 0.02, 0.18, 0.20, "RevenueSplit\nDIAMOND stakers\nrev-share")
 arr = dict(arrowstyle="->", lw=1.2, color="#345")
 ax.annotate("", (0.28, 0.76), (0.19, 0.81), arrowprops=arr)
 ax.annotate("", (0.57, 0.76), (0.48, 0.81), arrowprops=arr)
@@ -126,7 +126,7 @@ def header_footer(canvas, doc):
     canvas.saveState()
     canvas.setFont(SERI, 7.5); canvas.setFillColor(colors.HexColor("#555"))
     if doc.page > 1:
-        canvas.drawString(18*mm, H-12*mm, "DiamondTrading Research — whitepaper v0.2")
+        canvas.drawString(18*mm, H-12*mm, "DiamondTrading Research — whitepaper v0.3")
         canvas.drawRightString(W-18*mm, H-12*mm, "October 2026 · working draft")
         canvas.setStrokeColor(colors.HexColor("#999")); canvas.setLineWidth(0.4)
         canvas.line(18*mm, H-13.5*mm, W-18*mm, H-13.5*mm)
@@ -134,7 +134,7 @@ def header_footer(canvas, doc):
     canvas.drawCentredString(W/2, 10*mm, str(doc.page))
     canvas.restoreState()
 
-doc = BaseDocTemplate(os.path.join(HERE, "DiamondTrading_v0.2.pdf"), pagesize=A4,
+doc = BaseDocTemplate(os.path.join(HERE, "DiamondTrading_v0.3.pdf"), pagesize=A4,
     leftMargin=19*mm, rightMargin=19*mm, topMargin=20*mm, bottomMargin=16*mm,
     title="DiamondTrading: Solvent-First Turbo Markets", author="DiamondTrading Research")
 frame = Frame(doc.leftMargin, doc.bottomMargin, doc.width, doc.height, id="f")
@@ -162,34 +162,36 @@ E = []  # story
 
 # ---------- title page ----------
 E += [Spacer(1, 26*mm),
-      P("DiamondTrading: Queue-Bounded Turbo Markets", st_title),
-      P("A Bounded FIFO Payout Queue with a Hard Global Brake, Manipulation-Cost Position Caps,<br/>and Epoch-Decaying Anchored Loss-Mint Tokenomics for 1000x Leveraged Wagering", st_sub),
+      P("DiamondTrading: Transparent-Queue Turbo Markets", st_title),
+      P("A Public FIFO Payout Queue with Claim-Level Transparency, Manipulation-Cost Position Caps,<br/>and Counter-Cyclical Anchored Loss-Mint Tokenomics for 1000x Leveraged Wagering", st_sub),
       Spacer(1, 8*mm),
       P("DiamondTrading Research", st_auth),
-      P("Version 0.2 &nbsp;·&nbsp; October 2026 &nbsp;·&nbsp; supersedes v0.1 (full-reserve); implemented and fuzz-verified", st_auth),
+      P("Version 0.3 &nbsp;·&nbsp; October 2026 &nbsp;·&nbsp; supersedes v0.2 (queue-bounded); implemented and fuzz-verified", st_auth),
       Spacer(1, 10*mm),
       P("Abstract", st_abshead),
       P("Hyper-short-dated leveraged wagering — post margin, drag leverage to 1000x, bust or win within "
         "seconds — reached production scale and then collapsed under its own accounting: the deployed "
         "lineage descending from the Martin Galer queue/emission design accumulated dozens of audit "
         "findings, including outcome-manipulation and mint-accounting exploits [1][2]. v0.1 of this "
-        "paper eliminated the queue with full reserves; that correctly prevented debt but meant every "
-        "liability was pre-locked, a structure that cannot carry 1000x retail menus. "
-        "We present DiamondTrading v0.2, a rebuild that re-admits deferred payment <i>as a bounded, "
-        "auditable machine</i> rather than a swamp. <b>Layer one</b> is a queue-bounded payout engine: "
-        "profit claims the pool cannot cover become FIFO queue entries backed by a side bucket of "
-        "loser stakes; no winner may cut the line; a hard global cap QMAX halts sales the moment "
-        "queued debt exceeds it; and a sweep rule guarantees that loser money becomes pool money the "
-        "instant the queue is clean — the queue recovers or the product stops, there is no third "
-        "state (§4). <b>Layer two</b> is the measurement-driven quoting engine: venue routing by "
-        "deepest measurable book, VWAP-of-real-fills settlement anchors, and manipulation-cost "
-        "position caps κλω/ω̃ with no treasury terms, since the pool may legitimately be zero (§6). "
-        "<b>Layer three</b> is the anchored smart mint: loss rebates are capped at r(e) of a signed "
-        "fees-plus-edge anchor, with r(e) decaying 200%→30% over 360 epochs and an absolute epoch "
-        "ceiling (§7). The system is implemented — both payout engines, verifiers, tokenomics, and "
-        "the off-chain engine — with 95 contract assertions, 41 engine assertions, and five fuzz "
-        "seeds that mirror every money lane after every operation (§11). We state the deferred-payment "
-        "risk, the attester-quorum trust assumption, and the licensing constraint frankly (§12).", st_abs),
+        "paper eliminated the queue with full reserves (cannot carry 1000x menus); v0.2 re-admitted "
+        "the queue but bounded it with brakes that turned out to misprice the game itself. "
+        "We present DiamondTrading v0.3, the papertrade-lineage design taken to its honest end: "
+        "deferred payment exists, is public to the wei, and is never used as an excuse to stop the "
+        "machine. <b>Layer one</b> is a transparent FIFO payout engine: profit the pool cannot cover "
+        "becomes permanent, order-preserving on-chain claims; loser money feeds the pool directly; "
+        "every settlement inline-pays the oldest claims; there is no queue ceiling, no side bucket, "
+        "no pause switch — the product never stops selling, and every claimant reads their exact "
+        "position and owed amount from the contract itself (§4). <b>Layer two</b> is the "
+        "measurement-driven quoting engine: deepest-venue routing, VWAP-of-real-fills settlement "
+        "anchors, manipulation-cost caps κλω/ω̃ with no treasury terms (§6). <b>Layer three</b> is "
+        "the counter-cyclical anchored mint: DIAMOND emission starts at 200% of the signed "
+        "fees-plus-edge anchor, tightens −250bps/epoch as revenue grows (sustained success siết "
+        "emission), and re-eases +1000bps/epoch when revenue weakens — capped at 200%, floored at "
+        "30%, absolutely epoch-capped (§7). The system is implemented — both payout engines, "
+        "verifiers, tokenomics, and the off-chain engine — with 106 contract assertions, 45 engine "
+        "assertions, and five fuzz seeds mirroring every money lane after every operation (§11). "
+        "We state the unbounded-debt risk, the attester-quorum trust assumption, and the licensing "
+        "constraint frankly (§12).", st_abs),
       Spacer(1, 6*mm),
       P("<i>Provenance convention.</i> Every externally checkable claim carries exactly one tag, declared in its "
         "reference entry (§13): <b>[CITED]</b> measured/sourced, <b>[COMPUTED]</b> derived from cited data or the "
@@ -202,17 +204,18 @@ E += [P("1 &nbsp; Introduction", st_h1),
 P("Papertrade demonstrated that the retail gamblers' terminal is not a spot market with leverage "
   "controls; it is a <i>turbo market</i>: margin in, leverage to 1000x, bust price displayed, outcome in "
   "under a minute, plus a token kicker minted on losses that made losing feel like progress. It also "
-  "demonstrated the failure mode of building that product on an unbounded solvency queue and gross-loss "
-  "emissions: the accountability debt surfaced as 42 audit findings, two of them critical [2]. v0.1 of "
-  "this design went to the other extreme — full reserves at sale — which removed the debt and, with it, "
-  "the ability to sell the 1000x menus the product exists for. v0.2 keeps the game and <i>rebuilds the "
-  "debt as a machine</i>: a FIFO payout queue with a global hard brake (QMAX), a side bucket that "
-  "finances the line in the exact order winners arrived, stall refunds that never gate, and a sweep "
-  "that ends the bucket the moment the line is clean. The design rule stands: every hazard must be "
-  "either (i) impossible to express in code, or (ii) priced and bounded by a measurement, never by a "
-  "promise. Deferred payment is declared and bounded — never patched silently."),
+  "demonstrated the failure mode of building that product on hidden accounting and gross-loss "
+  "emissions: the accountability debt surfaced as 42 audit findings, two of them critical [2]. v0.1 "
+  "went to full reserves and could not sell the 1000x menus the product exists for; v0.2 bounded the "
+  "queue with a QMAX brake and a loser-custody rule, and testing showed both were theatre: a brake "
+  "that stops sales when the house is weakest is a death sentence, and custody rules that exclude "
+  "loser money from the pool starve the very queue they protect. v0.3 deletes them. What remains is "
+  "the papertrade design told honestly: a FIFO queue that never blocks sales, loser money that feeds "
+  "the pool directly, stall refunds that never gate, and claim-level transparency that tells every "
+  "user exactly where in line they stand. Deferred payment is declared, publicized per-claim — never "
+  "patched silently."),
 P("The remaining text is organized as follows. §2 recalls the lineage and the audit taxonomy we design "
-  "against. §3 defines actors, assets, and the trust model. §4 gives the queue-bounded payout "
+  "against. §3 defines actors, assets, and the trust model. §4 gives the transparent-FIFO payout "
   "engine and its lane invariant. §5 defines the instruments' payoffs. §6 specifies the GALE off-chain engine (routing, "
   "settlement persistence, caps, breaker, pricer). §7 specifies the smart mint. §8 treats verifiers. "
   "§9 runs the security analysis class by class. §10 covers economics. §11 reports implementation and "
@@ -225,17 +228,18 @@ P("<b>Martin Galer (2024-era)</b> introduced the zero-LP bootstrap: queue winner
   "short optionality handed to attackers (KV-02), and governance degradable to 1-of-2 signers (L-04) "
   "[2]. Our benchmark in §9 is this taxonomy; a modern turbo market fails by repeating any of it."),
 P("<b>Design stance.</b> We copy papertrade's <i>toy</i> (margin, leverage, bust price, seconds, mint on "
-  "loss) and re-engineer its <i>machinery</i> so each component has a bound a tester can measure: the "
-  "queue is FIFO with a declared ceiling and an external schedule, the side bucket sweeps to pool when "
-  "clean, settlement is VWAP-of-fills not midpoints, and insolvency stops sales instead of lying about "
-  "them [2][3][4]."),
+  "loss) and keep its one good instinct — the game never stops — while straightening every ledger it "
+  "left crooked: the queue is FIFO and public (each claim addressable; position readable on-chain), "
+  "loser money flows into the pool the instant it is realized, settlement is VWAP-of-fills not "
+  "midpoints, and the mint is anchored to signed real revenue with a rate that reacts to the protocol's "
+  "own health [2][3][4]."),
 fig("f1_payoff", 132, "Figure 2 — The two issuance shapes: a digital ticket (pay M·S or 0) and a capped-vanilla ramp (pay intrinsic up to the band). Both reserve the full maximum at sale; neither queues.")]
 
 # ---------- 3 system ----------
 E += [KeepTogether([P("3 &nbsp; Actors, assets, trust", st_h1),
 table([
  ["actor", "role", "what they can and cannot do [COMPUTED: contract code 5]"],
- ["player", "posts margin, receives tickets", "stake back instantly on any correct claim; profit paid now or via FIFO queue; 24h stall ⇒ permissionless stake refund; pause halts sales only"],
+ ["player", "posts margin, receives tickets", "stake back instantly on any correct claim; profit paid now or via FIFO queue; claimInfo says exactly where they stand; 24h stall ⇒ permissionless stake refund; nothing can pause sales"],
  ["LP", "pool capital backing payouts", "first-loss by construction (pool pays before any queue forms, proven in tests); ≥60% of realized revenue once the seeding target is met [5]"],
  ["quoter", "off-chain pricing engine", "signs quotes (σ-priced, κλω-capped, 30s TTL); cannot settle or move funds; worst-case = bad menus bounded by on-chain class clamps"],
  ["attester set (2-of-3)", "price persistence verification", "cannot settle alone; cannot forge (2 keys); stall ⇒ permissionless stake refund; threshold floored at 2 on-chain"],
@@ -248,52 +252,53 @@ P("Underlyers at launch [3][ASSUMED: menu], per-class enabled/cap/mult governanc
   "$327–392M on HL vs $399M Binance); <b>BNB — 200x class</b> (Binance $280–366M); "
   "<b>S&P500 & NASDAQ-100 equity perps — 100x class</b> (Hyperliquid HIP-3 only, ~$310–332M [4]). "
   "Routing per §6.1 [5].", st_body),
-fig("f5_arch", 150, "Figure 1 — System map: players post USDC; the quoter prices quotes; attesters verify venue prints; the engines pay now or queue FIFO; the mint and the rev-split close the loop.")]
+fig("f5_arch", 150, "Figure 1 — System map: players post USDC; the quoter prices quotes; attesters verify venue prints; the engines pay now or queue FIFO (publicly); the mint and the rev-split close the loop.")]
 
 # ---------- 4 reserve ----------
-E += [P("4 &nbsp; The queue-bounded payout engine", st_h1),
-P("Let B be the contract's USDC balance. Four accounting lanes partition it: <i>pool</i> (distributable "
-  "energy, fed by loser stakes and LP deposits), <i>side</i> (side bucket, loser money that still owes "
-  "the queue), <i>open</i> (sum of live stakes), and <i>debt</i> (sum of unpaid queue amounts — debt is "
-  "a liability, not cash: it is NOT part of B). The engine maintains at every block:"),
-P("<i>B = pool + side + open</i>, &nbsp;&nbsp; <i>debt ≥ 0</i>, &nbsp;&nbsp; <i>(debt = 0) ⇒ (side = 0)</i>", st_eq),
-P("Each lane is a first-class storage variable, never derived; <i>lanesIntact()</i> recomputes the "
-  "identity after every settlement and every treasury send [5], so a drift between accounting and cash "
-  "is loud on-chain, not silent until audit (H-01's habitat was drift discovered months late)."),
-P("<b>Sale.</b> A ticket of stake S and maximal profit P<sub>max</sub> may be sold iff (i) the class is "
-  "enabled with P<sub>max</sub> ≤ class profit cap, (ii) sales are unpaused, and (iii) <i>debt &lt; "
-  "QMAX</i> — the global hard brake (default $1M, owner ceiling $5M) [5]. Nothing about pool size gates "
-  "a sale: this is the deliberate bootstrap property v0.1 forfeited. Then <i>open += S</i>; "
-  "P<sub>max</sub> reserves nothing, ever."),
+E += [P("4 &nbsp; The transparent FIFO payout engine", st_h1),
+P("Let B be the contract's USDC balance. Two cash lanes partition it: <i>pool</i> (house money: fed by "
+  "loser stakes, premiums, and LP deposits) and <i>open</i> (sum of live stakes, fully player-owned). "
+  "The liability side is <i>debt</i> — the sum of queued, unpaid profits. Debt is NOT cash: it is the "
+  "house's public obligation, tracked to the wei. At every block:"),
+P("<i>B = pool + open</i>, &nbsp;&nbsp; <i>debt = Σ unpaid queued entries ≥ 0</i>", st_eq),
+P("Each lane is a first-class storage variable, never derived; <i>lanesIntact()</i> re-verifies the "
+  "identity after every settlement and every treasury send [5]. v0.3 has NO hidden accounting "
+  "surfaces: v0.2's side bucket (a second custody lane that answered &ldquo;where do loser funds sit "
+  "while the queue waits&rdquo;) is deleted — loser money lands in the pool, and the pool pays the "
+  "line. If the queue outruns the pool, every waiting claimant can see it happen."),
+P("<b>Sale.</b> A ticket of stake S and maximal profit P<sub>max</sub> sells iff its class is enabled "
+  "and P<sub>max</sub> ≤ the class profit cap. There are no other gates — v0.2's QMAX (a sales brake "
+  "that engaged precisely when the house was under stress) is removed by explicit directive: stopping "
+  "sales in a drawdown starves the payout stream, i.e. guarantees the worst outcome. <i>Selling "
+  "through the storm is the recovery mechanism; transparency is the safety mechanism.</i> "
+  "There is also no pause switch: neither sales, settlement, refunds, nor LP exit can be frozen by "
+  "anyone — ownership tunes menu config only [5]."),
 P("<b>Settlement of a correct claim</b> returns the stake in full, then pays <i>min(pool, net)</i> "
-  "where <i>net = (1−ρ)·profit</i>, ρ=2%. The unpaid remainder <i>u = net − paid</i> — when nonzero — "
-  "appends a FIFO queue entry; entry ids are a zero-folded array with a windowed (<i>head, live</i>) "
-  "view, so head-trimming frees gas while ids keep ordering [5]. <b>While debt &gt; 0, correct claims "
-  "enqueue in full</b> — paying a richer-pool-era newcomer ahead of an older claimant is "
-  "unrepresentable: the queue is consulted before any transfer. Lost stakes (KNOCKED) and residual "
-  "stakes (EXPIRED, 15% rebated to the buyer, the rest forfeit) route into <i>side</i> when debt &gt; 0, "
-  "else into <i>pool</i>. Every settlement then pays up to INLINE_HARVEST=4 queue entries from "
-  "<i>side</i> (≈1,950 gas marginal per entry [COMPUTED: §11 probe]); any keeper may call "
-  "<i>harvest(1..64)</i> for more, and LP exits refund their live-share pro-rata on the same lane "
-  "schedule."),
-P("<b>The sweep.</b> When the last entry clears (<i>debt → 0</i>), whatever remains in <i>side</i> "
-  "folds into <i>pool</i> in the same transaction [5]. Consequences: (i) loser money becomes pool money "
-  "only when nobody is waiting — this is the spec sentence <i>made code</i>; (ii) the bucket cannot "
-  "become a parallel shadow treasury — its lifetime is exactly the queue's."),
-P("<b>Theorems (fairness and progress).</b> (a) <i>No cut-in-line:</i> queue payments issue only to "
-  "entry ids ≥ <i>queueHead</i> in ascending order, and <i>queueHead</i> advances only when the head is "
-  "fully paid; hence any two payouts preserve arrival order (property G4, asserted on every fuzz "
-  "operation). (b) <i>Recovery-or-stop:</i> when <i>debt ≥ QMAX</i> new sales revert; debt strictly "
-  "decreases only via explicit <i>side</i> payments; the state machine can unwind debt or stop new "
-  "risk, but can never silently age out a winner's claim (v2 deleted every ticket→claim rekeying "
-  "path: what you hold is what asserts). (c) <i>Pause never gates refunds:</i> settle, stall-refund "
-  "(24h), harvest, LP-request/all-withdraw flows stay live under pause; only sales and LP deposits "
-  "stop [5]. ∎"),
+  "where <i>net = (1−ρ)·profit</i>, ρ=2%. The unpaid remainder appends a FIFO queue entry; entry ids "
+  "are a zero-folded array with a windowed (head, live) view [5]. <b>While debt &gt; 0, correct claims "
+  "enqueue in full</b> — paying a newcomer ahead of an older claimant is unrepresentable. Lost stakes "
+  "(KNOCKED) and the forfeited 85% of EXPIRED tickets flow into <i>pool</i> unconditionally "
+  "(papertrade rule); every settlement then inline-pays up to INLINE_HARVEST=4 queue entries from "
+  "<i>pool</i> (≈1,950 gas marginal per entry [COMPUTED]); any caller may <i>harvest(1..64)</i> for "
+  "more, and LP exit NAV slices are computed on the same lane arithmetic."),
+P("<b>Claim-level transparency (the frontend promise).</b> queueOf maps every ticket to its queue "
+  "entry; <i>claimInfo(ticketId)</i> returns (hasDebt, amountOwed, position, totalDebt) — position 1 "
+  "&ldquo;you are next&rdquo;. The UI rule is strict: when the queue is empty, nothing is said; when a "
+  "user holds a queued claim, the app states their position and amount (`mày đang đứng thứ X, được nợ "
+  "Y USDC`). Debt is a broadcast fact of the system, not a warning light for an ad-hoc brake: users "
+  "price it in, LPs see a measurable liability, and opportunistic mints (§7) react to it."),
+P("<b>Theorems (fairness and liveness).</b> (a) <i>No cut-in-line:</i> queue payments issue only to "
+  "entry ids ≥ queueHead in ascending order, and queueHead advances only when the head is fully paid "
+  "(property G4, asserted on every fuzz operation). (b) <i>Claims never die:</i> no code path expires, "
+  "cancels, or re-keys a queued amount — a winner's piece of the pie exists until paid in full. "
+  "(c) <i>Nothing freezes:</i> sales, settlement, stall-refund (24h), harvest, and LP-request/withdraw "
+  "are always live; there is no governance pause to yield, and the owner can never gate user funds [5]. "
+  "(d) <i>Recovery is the steady state, not a fallback:</i> in a debt phase, every loser dollar and "
+  "every new LP dollar pays the line FIFO; in a clean phase the same dollars feed the waterfall (§10). ∎"),
 P("<b>Honest accounting note.</b> The ρ=2% fee is a <i>haircut on the player's claim</i>, recorded in "
-  "the Settled event for the mint anchor — it never enters pool or side, because when pool &lt; net "
-  "that cash does not exist in the contract and inventing it breaks the lane identity. The Options "
-  "engine likewise books <i>premium only</i> as house income at settlement; the unpaid slice of maxPay "
-  "is a queue-bound liability haircut, not revenue [5].")]
+  "the Settled event for the mint anchor — it never pretends to be in-contract cash. The Options "
+  "engine books <i>premium only</i> as house income; the unpaid slice of maxPay is a queue-bound "
+  "liability haircut, not revenue [5].")]
 
 # ---------- 5 instruments ----------
 E += [P("5 &nbsp; Instruments", st_h1),
@@ -339,7 +344,7 @@ P("The attack that matters: dominate the settlement reference over its measureme
 P("P<sub>max</sub>(a,ω) = min( κ·λ<sub>a</sub>·ω/ω̃, &nbsp;classCap<sub>a</sub> ), &nbsp;&nbsp; ω̃ = 10s reference", st_eq),
 P("with κ = 1/4 single-read and 1/3 dual-read (an attacker must move both venues to pass G8) "
   "[ASSUMED: κ]. Note what is absent: no treasury term. v0.1's T/60 and 0.3T treasuries measured what "
-  "the vault could afford; under queue-bounded bootstrap the pool may legitimately be zero, so the "
+  "the vault could afford; under transparent-FIFO bootstrap the pool may legitimately be zero, so the "
   "honest ceiling is what the <i>market</i> can cost an attacker — plus the static on-chain class "
   "cap as outer wall (G3 only tightens). The ceiling collapses automatically in thin sessions: "
   "off-hours equity perps shrink toward zero without human scheduling. Figure 2 plots launch ceilings "
@@ -363,52 +368,59 @@ P("Why 2% is affordable where competitors take 4–6% [RECALLED: market range]: 
   "sticker <i>and</i> in expectation [COMPUTED: from the design above].")]
 
 # ---------- 7 mint ----------
-E += [P("7 &nbsp; Smart-mint v3: emissions losers cannot farm, decaying to schedule", st_h1),
+E += [P("7 &nbsp; Smart-mint v3: counter-cyclical emissions losers cannot farm", st_h1),
 P("Loss-minting is the retention engine and was the original protocol's exploit surface. The v3 mint "
-  "keeps the emotion (losing earns), removes the farm, and — new in v0.2 — <i>decays its allowance on "
-  "a public schedule</i> so boot can be generous without promising it forever:"),
+  "keeps the emotion (losing earns), removes the farm, and replaces any fixed calendar with the rate "
+  "curve a launch actually needs — rich at boot, siết as the project proves itself, nới again the "
+  "moment it stumbles:"),
 table([
  ["defense", "rule", "consequence"],
  ["net-loss epochs", "weight base = max(0, Σstake − Σpayout) per address per 6h epoch", "win-then-lose cycles cannot manufacture mintable losses"],
- ["fee-squared weight", "w = √(netLoss · feesPaid) × loyalty (1.25 if staked EDGE)", "mint requires real rake; √ forces 4× capital for 2× weight"],
- ["honest anchor", "anchor = Σ fees(user-haircuts) + Σ realized edge, signed by budgetAttester (USDC 1e6)", "budget reflects money that actually moved, not projections [5]"],
- ["decaying schedule", "budget ≤ r(e)·anchor/p(e); r(e) = max(30%, 200%−170%·e/360) linear", "early epochs rich (200%), the curve cools to a 30% annuity and cannot be revived [COMPUTED]"],
- ["hard ceiling", "mint ≤ epochCap per epoch (default 2M EDGE, ceiling 5M, lowerable, never raisable)", "sybils split a fixed pie; pro-rata yields no scale [COMPUTED]"],
-], [30, 76, 64]),
-P("The merkle distributor enforces the schedule on-chain against the signed anchor — EIP-191 over "
-  "(epochId, anchor, priceX1e8). Price p(e) has no on-chain reference until EDGE transfers open, so the "
-  "attester signs it; the bootstrap policy is p(e) ≈ $0.01·0.995^e, TWAP-chained once public "
-  "transferability exists. Anchors signed under a different domain/branding are rejected by the "
-  "on-chain identity probe [5]. EdgeToken itself boots non-transferable (allowlist-only moves for "
-  "sink/staking contracts); public transfer is a one-way flag flipped after launch liquidity criteria "
-  "are met, never re-lockable [5]. Weights are computed in the engine ledger [6]; root/post/claim is "
-  "covered end to end (§11). EDGE carries cashflow via RevenueSplit (pull-only notifyRevenue; claims "
-  "reconciled by cumulative-index snapshots, never live deltas), which is what makes an asset handed "
-  "out on losses worth holding instead of dumping."),
+ ["fee-squared weight", "w = √(netLoss · feesPaid) × loyalty (1.25 if staked DIAMOND)", "mint requires real rake; √ forces 4× capital for 2× weight"],
+ ["honest anchor", "anchor = Σ fees(user-haircuts) + Σ realized edge, signed by budgetAttester (USDC 1e6)", "budget reflects money that actually moved, not projections; hedged sybil pairs mint at most rate× their own fees — the farm is arithmetically bounded [5]"],
+ ["launch bait", "rate boots at 200% of anchor, absolute epoch cap on top", "early users are paid like early users"],
+ ["growth siết", "anchor &gt; prevAnchor ⇒ rate −250bps/epoch, floor 30%", "sustained revenue tightens emission automatically — success, not a vote, is what siết"],
+ ["weakness nới", "anchor &lt; prevAnchor ⇒ rate +1000bps/epoch, ceiling 200%", "shrinking revenue re-opens the tap, fast, to win flow back [COMPUTED]"],
+ ["hard ceiling", "mint ≤ epochCap per epoch (default 2M DIAMOND, ≤5M ceiling, lowerable, never raisable)", "sybils split a fixed pie; pro-rata yields no scale [COMPUTED]"],
+], [26, 78, 66]),
+P("The merkle distributor enforces the adaptive schedule on-chain against the signed anchor — EIP-191 "
+  "over (epochId, anchor, priceX1e8). Price p(e) has no on-chain reference until DIAMOND transfers "
+  "open, so the attester signs it (bootstrap p(e) ≈ $0.01; TWAP-chained after). Anchors signed under "
+  "a wrong domain are rejected by the on-chain identity probe [5]. DiamondToken itself boots "
+  "non-transferable (allowlist-only protocol moves); public transfer is a one-way flag flipped after "
+  "launch liquidity criteria, never re-lockable [5]. Weights come from the engine ledger [6]; "
+  "root/post/claim is covered end to end (§11). DIAMOND carries cashflow via RevenueSplit (pull-only "
+  "notifyRevenue; cumulative-index snapshots), which is what makes an asset handed out on losses worth "
+  "holding rather than dumping."),
 fig("f4_weights", 128, "Figure 5 — Iso-weight curves of w=√(loss·fees): weight grows sub-linearly in both inputs, so scale buys nothing and only sustained, rake-paying participation accumulates emission share."),
 P("8 &nbsp; Verifiers and the endgame", st_h1),
 P("Settlement inputs are M-of-N EIP-712 attestations (default 2-of-3; the threshold setter is "
   "hard-floored at 2 on-chain — L-04 cannot recur) [5]. Attesters each read the routed venue's trade "
-  "tape independently; dual-listed assets require the two venues' prints within 12bp before anyone "
-  "signs, so manipulation must succeed on two venues simultaneously to extract and on neither merely to "
-  "void tickets into refunds [ASSUMED: tolerance][COMPUTED: engine]. Anyone may relay a passing proof; "
-  "no attester can settle alone, block settlement, or fake a stall. If all attesters stall for 24h, "
-  "every live position unwinds to its stake permissionlessly [5]. The stated endgame is a verifier "
-  "reading HyperEVM L1Read trade-print state directly — deleting attesters from the path for "
-  "HL-routed assets — behind the same IOutcomeVerifier interface already implemented [5]."),
+  "tape independently; dual-listed assets require the two venues' prints within tolerance before "
+  "anyone signs [ASSUMED: tolerance][COMPUTED: engine]. Anyone may relay a passing proof; no attester "
+  "can settle alone, block settlement, or fake a stall. If all attesters stall for 24h, every live "
+  "position unwinds to its stake permissionlessly [5]. "
+  "<b>Can the code just READ the price itself? Honest no, for launch.</b> (i) Binance-settled assets "
+  "(BTC/ETH/SOL/BNB) have no on-chain price oracle on HyperEVM — there is nothing canonical for a "
+  "contract to read. (ii) Even for HL-native assets, L1Read precompiles expose marks/spot prices "
+  "<i>at this instant</i>; settlement needs the VWAP of real fills over the ω window, a tape query the "
+  "precompiles do not answer — a single mark read is exactly the BBO-twitch surface KV-01 warned "
+  "about [2]. The viable endgame is a TWO-STEP design: attesters sign the window VWAP and an "
+  "L1Read sanity circuit rejects any attested close deviating from the mark by &gt;x bps — keeping "
+  "the quorum while bounding its worst case [5][ASSUMED: x]."),
 P("9 &nbsp; Security analysis", st_h1),
 P("Method: replay the audit taxonomy of record [2] and ask for each class whether it exists here."),
 table([
  ["exploit class (Guardian id)", "their habitat", "status here", "mechanism"],
- ["payout queue / side-bucket accounting (H-01..M-05)", "queue vs ledger divergence", "contained", "FIFO + QMAX brake; lanesIntact() asserted after every mutation; sweep ends the bucket when clean (§4)"],
- ["BBO-midpoint settlement (KV-01)", "single-source midpoint", "absent", "VWAP persistence G2 + 2-of-3 tolerance (1bp) G8"],
+ ["payout queue accounting / hidden debt (H-01..M-05)", "queue vs ledger divergence", "contained", "single custody lane; lanesIntact() after every mutation; debt is a public per-claim read (claimInfo)"],
+ ["BBO-midpoint settlement (KV-01)", "single-source midpoint", "absent", "VWAP persistence G2 + 2-of-3 tolerance; L1Read cross-check is the stated endgame"],
  ["short optionality / straddle (KV-02)", "unpriced option grants", "bounded", "payout shapes closed-form; class clamps on-chain; no free bands"],
  ["unconstrained bet sizing (M-02/05)", "flat caps vs flow", "closed", "G3 κλω/ω̃ dynamic caps + on-chain class profit caps (§6.3)"],
- ["gross-mint / mint accounting (KV-04)", "loss-mint farming", "closed", "net-epoch √-weights + r(e)-schedule on signed anchor + absolute epoch cap (§7)"],
- ["keeper/governance capture (L-04, I-20)", "1-of-2, timelock→0", "closed", "threshold floor 2 on-chain; owner→Safe+7d timelock; pause = sales/deposits only"],
- ["stale settlement / trapped funds (L-11)", "keeper stall", "closed", "24h permissionless refund; pause never gates refunds/harvest"],
- ["quote replay / intent abuse (KV-14)", "WESig re-use", "closed", "buyer-bound EIP-712 + ≤30s TTL + worst-bounds; replay economically neutral; wrong-domain sigs rejected (probed)"],
- ["liquidity-honest bootstrap (new)", "silent insolvency", "closed", "sales halt at QMAX debt; claims never expire; debt decrease only by side-bucket FIFO payments (§4)"],
+ ["gross-mint / mint accounting (KV-04)", "loss-mint farming", "closed", "net-epoch √-weights + adaptive rate on signed anchor + absolute epoch cap; hedged pairs capped at rate× their own fees (§7)"],
+ ["keeper/governance capture (L-04, I-20)", "1-of-2, timelock→0, pause-gating", "closed", "threshold floor 2 on-chain; NO pause switch exists at all; owner can never gate user funds"],
+ ["stale settlement / trapped funds (L-11)", "keeper stall", "closed", "24h permissionless refund; settlement/harvest always live"],
+ ["quote replay / intent abuse (KV-14)", "WESig re-use", "closed", "buyer-bound EIP-712 + ≤30s TTL + worst-bounds; wrong-domain sigs rejected (probed)"],
+ ["sybil multi-account hedge-mint (new)", "long+short pairs across wallets", "arithmetically bounded", "anchor counts fees+edge, budget ≤ rate× that anchor; pair mints at most rate× its own rake (§7, fuzz-checked)"],
 ], [42, 38, 24, 66]),
 P("Residual risks, stated: attester liveness/collusion above floor (mitigated, not eliminated); "
   "κλω is a bound, not a proof of manipulation cost (books can thin faster than flow); equity-perp "
@@ -418,38 +430,39 @@ P("Residual risks, stated: attester liveness/collusion above floor (mitigated, n
 # ---------- 10 econ ----------
 E += [P("10 &nbsp; Economics", st_h1),
 P("Revenue waterfall on realized edge, gated by queue health [5]: distributable = (pool − "
-  "TARGET_POOL) × 80%, computable only when the queue is fully clean (debt = 0 ∧ side = 0 — a payout "
-  "crisis diverts 100% of flow to solvency, none to distributions). Of each distribution: ≥60% goes "
-  "LP-claim on a pro-rata cumulative index (permissionless claimLP — the LP floor is code, not policy), "
-  "and the remainder funds the mint budget anchor + staker rev-share + operations [5][ASSUMED]. LPs "
-  "underwrite variance in exchange for the majority share and are provably first-loss: the pool pays "
-  "winners before any queue exists, and exits settle pro-rata against the actual pool [5][6]. The "
-  "growth loop: queue-cleared epochs mint rebates that convert losers into EDGE stakeholders; staker "
-  "rev-share aligns the losing-but-loyal cohort with house health; cheaper published edge (ρ=2%) plus "
-  "graded ramp wins drive flow; flow deepens LP returns and the λ-derived caps that permit larger "
-  "honest tickets."),
+  "TARGET_POOL) × 80%, computable only when the queue is fully clean (debt = 0 — during a payout "
+  "crisis 100% of flow works the line, none leaks to distributions). Of each distribution: ≥60% goes "
+  "LP-claim pro-rata on a cumulative index (permissionless claimLP — the LP floor is code, not "
+  "policy), the remainder funds the mint anchor + staker rev-share + operations [5][ASSUMED]. LPs "
+  "underwrite variance for the majority share and are provably first-loss: the pool pays winners "
+  "before any queue forms, and exits settle pro-rata against the actual pool [5][6]. The growth loop: "
+  "adaptive mint pays launch-rich rebates while flow proves itself (§7); staker rev-share keeps the "
+  "losing-but-loyal cohort invested; ρ=2% plus graded ramp wins drive flow; flow deepens LP returns, "
+  "shrinks observed debt phases, and the λ-derived caps permit larger honest tickets."),
 P("Fee stance versus incumbents: one number, ρ = 2%, published, no deposit/withdrawal/turnover fees "
   "[ASSUMED]. The competitive claim is arithmetic, not adjectives: at equal flow, a toxic-flow tax "
   "removed by G2/G4 funds the price cut."),
 P("11 &nbsp; Implementation status and evidence", st_h1),
 table([
  ["component", "artifact", "evidence"],
- ["payout engines", "DiamondHouse, DiamondOptions (queue-bounded) [5]", "95/95 contract assertions green: FIFO ordering, exact-debt partials, inline harvest, sweep-on-clean, QMAX stop-sales, stall refunds, EXPIRED rebate timing, lane identity B = pool+side+open"],
- ["verifiers", "MultiAttesterVerifier, MultiPriceVerifier [5]", "2-of-3, floor-2, 1bp tolerance paths, wrong-domain signature probes"],
- ["tokenomics", "EdgeDistributor (r(e)-schedule + anchor EIP-191), RevenueSplit (pull-only notify), EdgeToken (bootstrap lock, one-way enable) [5]", "r(e) 200%→30% decay, cap clamp, anchor mis-sign rejected, domain-mismatch rejected, double-claim blocked, transfer guard (4-path probe) tested"],
- ["engine", "engine/ (venues, caps, pricer, quoter, attester, ledger) [6]", "41/41 assertions incl. ganache interop: engine-signed quotes sell, engine attestations settle, engine merkle posts/claims on-chain; caps carry no treasury terms"],
- ["fuzzing", "property fuzz, 150-op seeds 1337/7/42/90210/555", "167–177 lane checks per seed, all green; queues up to $148k debt exercised; FIFO payments observed 6–16× per seed"],
+ ["payout engines", "DiamondHouse v3, DiamondOptions v3 (transparent FIFO) [5]", "106/106 contract assertions green: FIFO ordering, exact-debt partials, inline harvest from pool, no-brake sales under arbitrary debt, absence of any pause switch, stall refunds, EXPIRED rebate timing, claimInfo position/amount reads, lane identity B = pool+open"],
+ ["verifiers", "MultiAttesterVerifier, MultiPriceVerifier [5]", "2-of-3, floor-2, tolerance paths, wrong-domain signature probes"],
+ ["tokenomics", "DiamondDistributor (adaptive counter-cyclical rate + anchor EIP-191), RevenueSplit (pull-only notify), DiamondToken (bootstrap lock, one-way enable) [5]", "launch 200%, −250/epoch on growth, +1000/epoch on weakness, floor/ceiling clamps, cap clamp, anchor mis-sign rejected, double-claim blocked, transfer guard + one-way enable tested"],
+ ["engine", "engine/ (venues, caps, pricer, quoter, attester, ledger) [6]", "45/45 assertions incl. ganache interop: engine-signed quotes sell, engine attestations settle, engine merkle posts/claims on-chain; caps carry no treasury terms; adaptive-rate mirror verified"],
+ ["fuzzing", "property fuzz, 150-op seeds 1337/7/42/90210/555", "156–163 lane checks per seed, all green; debt phases up to $163k exercised; 16–48 FIFO payments per seed; zero distributions while in debt"],
 ], [40, 70, 60]),
 P("12 &nbsp; Limitations (the honest page)", st_h1),
-P("(i) <b>Deferred payment is a real risk by construction.</b> queue-bounded payout means winners may "
-  "legitimately wait; debt is extinguished only by side-bucket FIFO payments (loser flow) or LP "
-  "backfill, and sales stop at QMAX — that is recovery, not guarantee. Every claim is permanent, "
-  "order-preserving, and undeniable, but timing is a market variable. (ii) Settlement is "
+P("(i) <b>Deferred payment is a real risk by construction, and v0.3 removes the last artificial brake.</b> "
+  "There is no QMAX: debt can exceed any bound, sales never stop, and debt is extinguished only by "
+  "loser flow and LP backfill paying the line FIFO. What users hold against this is information, not "
+  "promises: each claim is permanent, order-preserving, exactly priced, and individually readable; "
+  "totalDebt is a public broadcast; distributable() hard-zeros during any debt phase; and 24h stalls "
+  "refund in full. Timing is a market variable — declared, not laundered into a brake. (ii) Settlement is "
   "attester-quorum, not cryptographic trade-print proof; the L1Read verifier is the largest open "
   "item. (iii) The collared σ inputs come from the quoter within clamp bounds; dual-print anchored "
   "strikes are specified, not shipped. (iv) κλω is a lower bound assembled from estimator assumptions; "
   "stress may invalidate the estimator faster than the breaker reacts. (v) Equity perps trade 24/7 on "
-  "one venue; off-hours is handled by cap decay plus a quoter curfew, both [ASSUMED]. (vi) EDGE's "
+  "one venue; off-hours is handled by cap decay plus a quoter curfew, both [ASSUMED]. (vi) DIAMOND's "
   "bootstrap is non-transferable by design until a one-way flag; hold-horizon risk is declared. "
   "(vii) Regulatory: an offshore, unlicensed distribution of this product scores zero on a three-year "
   "horizon; licensing (or licensing-grade geofencing) is a launch gate, not a growth item [ASSUMED]."),
@@ -462,28 +475,31 @@ P("[3] [CITED: api.binance.vision snapshots fetched 2026-10-22 + user-provided B
   "spot depths/24h volumes in research/LIQUIDITY.md.", st_ref),
 P("[4] [CITED: user-provided Hyperliquid screenshots, app.hyperliquid.xyz, 2026-10-20] HYPE OI/volume, "
   "market list incl. HIP-3 equity perps.", st_ref),
-P("[5] [COMPUTED: diamondtrading/contracts/ DiamondHouse.sol, DiamondOptions.sol, Verifiers.sol, "
-  "EdgeDistributor.sol, EdgeToken.sol, RevenueSplit.sol — this repository] all on-chain behavior cited above.", st_ref),
+P("[5] [COMPUTED: diamondtrading/contracts/ DiamondHouse.sol v3, DiamondOptions.sol v3, Verifiers.sol, "
+  "DiamondDistributor.sol, DiamondToken.sol, RevenueSplit.sol — this repository] all on-chain behavior cited above.", st_ref),
 P("[6] [COMPUTED: diamondtrading/engine/ + test/engine.test.js + test/fuzz.js — this repository] engine behavior cited above.", st_ref),
 P("[7+] [ASSUMED]/[RECALLED] parameters (κ, ω, ρ, tolerances, splits, curfews, market fee ranges) as "
   "marked inline.", st_ref),
 Spacer(1, 4*mm),
 P("TÓM TẮT — bản tiếng Việt", st_h1),
-P("DiamondTrading v0.2 là sàn turbo kiểu papertrade (nạp margin, đòn bẩy đến 1000x ở BTC/ETH, biết giá "
-  "bust trước khi bấm, thắng thua trong 30–300 giây, thua được mint EDGE) được dựng lại từ nền: "
-  "(1) tiền thắng trả ngay từ pool, phần chưa đủ vào hàng đợi FIFO — không ai được vượt hàng, nợ chạm "
-  "trần QMAX thì sàn ngừng bán vé mới, tiền thua chỉ thành tiền pool khi hàng đợi sạch (lệnh sweep "
-  "trong cùng giao dịch); (2) giá settle là VWAP của lệnh khớp thật trên sàn sâu nhất từng tài sản "
+P("DiamondTrading v0.3 là sàn turbo kiểu papertrade (nạp margin, đòn bẩy đến 1000x ở BTC/ETH, biết giá "
+  "bust trước khi bấm, thắng thua trong 30–300 giây, thua được mint DIAMOND) được dựng lại từ nền: "
+  "(1) tiền thắng trả ngay từ pool nếu đủ; phần chưa đủ vào hàng đợi FIFO — không ai được vượt hàng, "
+  "không có trần nợ QMAX, sàn không bao giờ ngừng bán; mỗi ngườờ tự đọc được vị trí của mình trong hàng "
+  "đợi và số tiền đang được nợ qua claimInfo (app chỉ thông báo khi thực sự có nợ); tiền thua đổ "
+  "thẳng vào pool — không side bucket, không lệnh sweep; không có nút pause nào, không ai đóng băng "
+  "được tiền của ai; (2) giá settle là VWAP của lệnh khớp thật trên sàn sâu nhất từng tài sản "
   "(BTC/ETH/SOL/BNB đi Binance; HYPE đi Hyperliquid; S&P500/NASDAQ100 chỉ có trên HL HIP-3); trần "
-  "lệnh = min(κλω, cap lớp on-chain) — không còn giới hạn theo treasury vì pool được phép bằng 0 lúc "
-  "khởi động; (3) mint khi thua nhưng chống farm: lỗ ròng theo epoch, trọng số √(lỗ × phí) × hệ số "
-  "trung thành, ngân sách = r(e) × doanh thu thật có chữ ký, r(e) giảm tuyến tính 200% → 30% trong "
-  "360 epoch và không ai tăng ngược được, trần tuyệt đối 2M EDGE/epoch; (4) phí công khai 2% khấu trừ "
-  "trên phần thắng; (5) EDGE khóa chuyển giao trong bootstrap, mở một chiều sau khi đủ thanh khoản, "
-  "stake EDGE được chia doanh thu. Bộ kiểm thử xanh toàn phần: 95 kiểm chứng hợp đồng, 41 kiểm chứng "
-  "engine, fuzz 5 seed × ~170 bất biến. Rủi ro được khai báo thẳng: trả chậm là có thật khi queue kẹt "
-  "(claim không mất, chỉ chờ), attester 2-trong-3 vẫn là điểm tin cậy, và điều kiện pháp lý là cổng "
-  "ra mắt chứ không phải việc để sau.", st_body)]
+  "lệnh = min(κλω, cap lớp on-chain); (3) mint khi thua nhưng chống farm: lỗ ròng theo epoch, trọng "
+  "số √(lỗ × phí) × hệ số trung thành; ngân sách = rate × doanh thu thật có chữ ký, với rate THÍCH "
+  "ỨNG: khởi động 200% (giai đoạn dụ anh em), doanh thu tăng thì siết dần −250bps/epoch về sàn 30%, "
+  "doanh thu sụt thì nới nhanh +1000bps/epoch lên lại trần 200%; không ai chỉnh tay được; (4) kể cả "
+  "bọn nhiều tài khoản hedge long/short để farm cũng chỉ mint tối đa rate× phí chúng tự đốt; (5) phí "
+  "công khai 2% khấu trừ trên phần thắng; (6) DIAMOND khóa chuyển giao trong bootstrap, mở một chiều "
+  "sau khi đủ thanh khoản, stake DIAMOND được chia doanh thu. Bộ kiểm thử xanh: 106 kiểm chứng hợp "
+  "đồng, 45 kiểm chứng engine, fuzz 5 seed × ~160 bất biến. Rủi ro khai báo thẳng: trả chậm là có thật "
+  "khi queue kẹt (claim không bao giờ mất, chỉ chờ; toàn bộ nợ là số liệu công khai), attester "
+  "2-trong-3 vẫn là điểm tin cậy (L1Read cross-check là lộ trình), và điều kiện pháp lý là cổng ra mắt.", st_body)]
 
 doc.build(E)
-print("PDF built:", os.path.getsize(os.path.join(HERE, "DiamondTrading_v0.2.pdf")), "bytes")
+print("PDF built:", os.path.getsize(os.path.join(HERE, "DiamondTrading_v0.3.pdf")), "bytes")

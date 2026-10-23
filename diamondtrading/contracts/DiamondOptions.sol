@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: MIT
-// DiamondOptions v2 — capped-vanilla ramp, queue-bounded payouts (same §4-v2 mechanics as DiamondHouse).
+// DiamondOptions v3 — capped-vanilla ramp, transparent FIFO payouts (same mechanics as DiamondHouse v3).
 //
 //   Payoff at attested close C (European, VWAP of real prints):
 //     CALL: pay = maxPay · min(C−K, band·K)/(band·K)   (0 if C ≤ K)
 //     PUT:  pay = maxPay · min(K−C, band·K)/(band·K)   (0 if C ≥ K)
 //   maxPay = premium × M (M ≤ class cap, ≤ 25x envelope — ramps already saturate at the band).
 //   ρ = 2% of the payout withheld at settle; net payout pays from pool if the queue is clean,
-//   else goes entirely to the FIFO (no jumping the line). Premium and the un-paid band slice
-//   are house income → sideBucket while in debt, else pool.
+//   else goes entirely to the FIFO (no jumping the line). Premiums are house income → pool,
+//   directly, always (papertrade rule). No QMAX, no pause: positions sell regardless of debt.
+//   claimInfo(option-id) reports queue position + amount owed.
 pragma solidity 0.8.26;
 
 interface IERC20MinO {
@@ -61,7 +62,6 @@ contract DiamondOptions {
     uint256 public constant STALL_DELAY = 24 hours;
     uint256 public constant INLINE_HARVEST = 4;
     uint256 public constant HARVEST_MAX = 64;
-    uint256 public constant QMAX_HARD_CEILING = 5_000_000e6;
 
     bytes32 public constant OQUOTE_TYPEHASH = keccak256(
         "OQuote(uint8 classId,uint8 dir,uint128 premium,uint32 multX1e4,uint32 bandBps,"
@@ -72,14 +72,11 @@ contract DiamondOptions {
     address public owner;
     address public quoterSigner;
     address public priceVerifier;
-    bool    public salesPaused;
 
     uint256 public pool;
-    uint256 public sideBucket;
     uint256 public openPremiums;  // player lane: unsettled premiums
     uint256 public queueDebt;
 
-    uint256 public maxQueueDebt = 1_000_000e6;
 
     Option_[]   public options;
     QueueEntry[] public payoutQueue;
@@ -98,7 +95,6 @@ contract DiamondOptions {
     event OQueued(uint256 indexed entryId, uint256 indexed optionId, address owner, uint256 amount);
     event ODequeued(uint256 indexed entryId, address owner, uint256 amount);
     event ParamSet(string what, uint256 value);
-    event SalesPaused(bool on);
 
     constructor(address _usdc, address _quoter) {
         require(_usdc != address(0) && _quoter != address(0), "zero addr");
@@ -112,7 +108,21 @@ contract DiamondOptions {
     }
 
     function lanesIntact() public view returns (bool) {
-        return usdc.balanceOf(address(this)) == pool + sideBucket + openPremiums;
+        return usdc.balanceOf(address(this)) == pool + openPremiums;
+    }
+
+    /// queue transparency: position (1 = next to pay) + amount owed; hasDebt=false when clean.
+    mapping(uint256 => uint256) public queueOf; // optionId → entryId+1 (0 = never queued)
+    function claimInfo(uint256 optionId) external view returns (
+        bool hasDebt, uint256 amountOwed, uint256 position, uint256 totalDebt
+    ) {
+        uint256 ref = queueOf[optionId];
+        totalDebt = queueDebt;
+        if (ref == 0) return (false, 0, 0, totalDebt);
+        uint256 entryId = ref - 1;
+        QueueEntry storage e = payoutQueue[entryId];
+        if (e.amount == 0) return (false, 0, 0, totalDebt);
+        return (true, uint256(e.amount), entryId - queueHead + 1, totalDebt);
     }
     function liveQueueEntries() public view returns (uint256) {
         return payoutQueue.length - queueHead;
@@ -132,7 +142,6 @@ contract DiamondOptions {
     function buyOption(OQuote calldata q, bytes calldata sig, uint64 worstStrikeX1e8, uint64 ttl)
         external nonReentrant returns (uint256 id)
     {
-        require(!salesPaused, "sales halted");
         require(ttl == 30 || ttl == 60 || ttl == 120 || ttl == 300, "bad ttl");
         require(q.validUntil >= block.timestamp, "quote expired");
         require(q.validUntil <= block.timestamp + QUOTE_TTL, "quote too far ahead");
@@ -157,7 +166,6 @@ contract DiamondOptions {
         uint256 maxPay = premium * q.multX1e4 / 10_000;
         require(premium > 0, "zero premium");
         require(maxPay <= cc.payCap, "pay over class cap");
-        require(queueDebt < maxQueueDebt, "queue saturated (QMAX)");
 
         require(usdc.transferFrom(msg.sender, address(this), premium), "pay in");
         openPremiums += premium;
@@ -185,8 +193,8 @@ contract DiamondOptions {
 
         uint256 payout = payoutOf(o.dir, o.strikeX1e8, o.bandBps, closePx, o.maxPay);
         // house income = the premium (real cash). The un-paid band slice is a liability haircut,
-        // NOT cash — maxPay was never segregated in v2.
-        if (queueDebt > 0) sideBucket += o.premium; else pool += o.premium;
+        // NOT cash — maxPay was never segregated. Premium feeds pool directly (papertrade rule).
+        pool += o.premium;
 
         uint256 feeTaken = payout * FEE_BPS / BPS;   // ρ haircut on the player's claim (see house)
         uint256 net = payout - feeTaken;
@@ -224,23 +232,22 @@ contract DiamondOptions {
     function _enqueue(address who, uint256 amount, uint64 optionId) internal {
         payoutQueue.push(QueueEntry({ owner: who, amount: uint128(amount), optionId: optionId }));
         queueDebt += amount;
+        queueOf[optionId] = payoutQueue.length; // entryId+1 for claimInfo()
         emit OQueued(payoutQueue.length - 1, optionId, who, amount);
     }
     function _payQueue(uint256 maxN) internal {
         uint256 n = maxN;
-        while (n > 0 && queueHead < payoutQueue.length && sideBucket > 0) {
+        while (n > 0 && queueHead < payoutQueue.length && pool > 0) {
             QueueEntry storage e = payoutQueue[queueHead];
-            uint256 pay = e.amount > sideBucket ? sideBucket : e.amount;
+            uint256 pay = e.amount > pool ? pool : e.amount;
             e.amount -= uint128(pay);
-            sideBucket -= pay;
-            queueDebt  -= pay;
+            pool -= pay;
+            queueDebt -= pay;
             require(usdc.transfer(e.owner, pay), "queue out");
             emit ODequeued(queueHead, e.owner, pay);
             if (e.amount == 0) queueHead++;
             n--;
         }
-        // sweep: once the queue is clean, leftover losses/fees become pool money (§4-v2)
-        if (queueDebt == 0 && sideBucket > 0) { pool += sideBucket; sideBucket = 0; }
     }
     function harvest(uint256 n) external nonReentrant {
         require(n > 0 && n <= HARVEST_MAX, "n bounds");
@@ -254,13 +261,8 @@ contract DiamondOptions {
         classCfg[classId] = ClassCfg(maxMult2, payCap, enabled);
         emit ParamSet("classCfg", uint256(classId));
     }
-    function setMaxQueueDebt(uint256 q) external onlyOwner {
-        require(q <= QMAX_HARD_CEILING, "qmax ceiling");
-        maxQueueDebt = q; emit ParamSet("maxQueueDebt", q);
-    }
     function setQuoter(address qa) external onlyOwner { require(qa != address(0), "zero"); quoterSigner = qa; emit ParamSet("quoter", uint256(uint160(qa))); }
     function setPriceVerifier(address v) external onlyOwner { require(v != address(0), "zero"); priceVerifier = v; emit ParamSet("verifier", uint256(uint160(v))); }
-    function pauseSales(bool p) external onlyOwner { salesPaused = p; emit SalesPaused(p); }
 
     function _recoverSig(bytes32 digest, bytes calldata sig) internal pure returns (address) {
         require(sig.length == 65, "sig len");

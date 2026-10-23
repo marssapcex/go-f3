@@ -1,0 +1,24 @@
+{
+  "chainId": 31337,
+  "rpc": "http://127.0.0.1:8545",
+  "contracts": {
+    "USDC": "0x5017A545b09ab9a30499DE7F431DF0855bCb7275",
+    "DIAMOND": "0x86072CbFF48dA3C1F01824a6761A03F105BCC697",
+    "Distributor": "0xFF6049B87215476aBf744eaA3a476cBAd46fB1cA",
+    "House": "0xA586074FA4Fe3E546A132a16238abe37951D41fE",
+    "Options": "0x2D8BE6BF0baA74e0A907016679CaE9190e80dD0A",
+    "OutcomeVerifier": "0xaf5C4C6C7920B4883bC6252e9d9B8fE27187Cf68",
+    "PriceVerifier": "0xDDb64fE46a91D46ee29420539FC25FD07c5FEa3E",
+    "RevenueSplit": "0x22d5C8BdD4346b390014a07109a8F830094d4abf"
+  },
+  "keys": {
+    "quoter": "0x02484cb50AAC86Eae85610D6f4Bf026f30f6627D",
+    "attesters": [
+      "0x8263Fce86B1b78F95Ab4dae11907d8AF88f841e7",
+      "0xcF2d5b3cBb4D7bF04e3F7bFa8e27081B52191f91",
+      "0x86c53Eb85D0B7548fea5C4B4F82b4205C8f6Ac18"
+    ],
+    "budgeter": "0x08A2DE6F3528319123b25935C92888B16db8913E"
+  },
+  "note": "demo only — ganache deterministic mnemonic, DO NOT send real funds"
+}

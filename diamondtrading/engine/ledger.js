@@ -1,20 +1,30 @@
-// Epoch ledger + anti-farm smart mint v2 (time-decayed budget — NO solvency/SRI throttle).
+// Epoch ledger + anti-farm smart mint v3 (counter-cyclical adaptive budget — mirror of
+// DiamondDistributor v3): the mint RATE is not a calendar schedule. It starts at 200% of
+// the signed revenue anchor (launch bait), tightens −250bps per growth epoch toward 30%,
+// and re-eases +1000bps per weak epoch (never above 200%). Growth siết, yếu thì nới.
 // Feeds: per-position settled records { owner, stake, payout, feePaid, ts }.
 // Per epoch: net loss per address, weight w = √(netLoss × feesPaid) × loyalty,
-// budget = r(e) × signed anchor (fees + realized edge — NEVER gross losses),
-// converted USDC→EDGE at the signed reference price, absolute token cap on top.
-// Merkle root/proofs in the EXACT EdgeDistributor format (OZ sorted-pair,
+// budget = rate × signed anchor (fees + realized edge — NEVER gross losses),
+// converted USDC→DIAMOND at the signed reference price, absolute token cap on top.
+// Merkle root/proofs in the EXACT DiamondDistributor format (OZ sorted-pair,
 // leaf = keccak256(concat(keccak256(abi.encode(epochId, account, amount))))).
 import { ethers } from "ethers";
 
-export const MINT_SCHEDULE = { R0_BPS: 20000, R_FLOOR_BPS: 3000, N_DECAY: 360 };
+export const MINT_RATE = { R_MAX_BPS: 20000, R_FLOOR_BPS: 3000, STEP_DOWN_BPS: 250, STEP_UP_BPS: 1000 };
+export const LAUNCH_RATE_BPS = 20000;
 
-/** r(e) in bps of anchor: 20000 → 3000 linearly over N_DECAY epochs, floor forever after.
- *  Mirrors EdgeDistributor.rateBps exactly. */
-export function rateBps(epochId) {
-  if (epochId >= MINT_SCHEDULE.N_DECAY) return MINT_SCHEDULE.R_FLOOR_BPS;
-  return Math.floor(MINT_SCHEDULE.R0_BPS -
-    (MINT_SCHEDULE.R0_BPS - MINT_SCHEDULE.R_FLOOR_BPS) * epochId / MINT_SCHEDULE.N_DECAY);
+/** Mirror of DiamondDistributor.projectedRateBps — given the rate stored on-chain and the
+ *  previous signed anchor (null on the very first epoch). */
+export function projectedRate(rateBpsNow, prevAnchorUsd, anchorUsd) {
+  if (prevAnchorUsd === null) return rateBpsNow;
+  const M = MINT_RATE;
+  if (anchorUsd > prevAnchorUsd) {
+    return rateBpsNow > M.R_FLOOR_BPS + M.STEP_DOWN_BPS ? rateBpsNow - M.STEP_DOWN_BPS : M.R_FLOOR_BPS;
+  }
+  if (anchorUsd < prevAnchorUsd) {
+    return Math.min(M.R_MAX_BPS, rateBpsNow + M.STEP_UP_BPS);
+  }
+  return rateBpsNow;
 }
 
 export class EpochLedger {
@@ -59,15 +69,15 @@ export class EpochLedger {
     return { rows, ...sums };
   }
 
-  /** Budget-capped pro-rata mint (EDGE 18dp BigInt).
+  /** Budget-capped pro-rata mint (DIAMOND 18dp BigInt).
    *  anchor: USDC(6dp) realized fees+edge, signed by budgetAttester WITH the price.
-   *  priceX1e8: USDC-per-EDGE reference (x1e8). tokenBudget = anchor × r(e)/1e4 × 1e20/price,
+   *  priceX1e8: USDC-per-DIAMOND reference (x1e8). tokenBudget = anchor × r(e)/1e4 × 1e20/price,
    *  then clamped by the absolute epoch cap. */
-  mintAmounts(epochId, { priceX1e8 = 1_000_000n /* $0.01 */, ...wopts } = {}) {
+  mintAmounts(epochId, { priceX1e8 = 1_000_000n /* $0.01 */, rateBps = LAUNCH_RATE_BPS, ...wopts } = {}) {
     const { rows, anchor } = this.weights(epochId, wopts);
-    const rate = rateBps(epochId);
+    const rate = rateBps; // caller supplies the rate the contract would project for this epoch
     const usdBudget = anchor * BigInt(Math.floor(rate)) / 10_000n;             // 6d USDC
-    let budget = usdBudget * 10n ** 20n / BigInt(priceX1e8);                  // 18d EDGE
+    let budget = usdBudget * 10n ** 20n / BigInt(priceX1e8);                  // 18d DIAMOND
     if (budget > this.epochCapToken) budget = this.epochCapToken;            // absolute cap
     // pure-BigInt allocation: scale float weights to 1e9 fixed-point first (budgets in
     // 18-dec EDGE routinely exceed 2^53, so Number() would corrupt the split)
@@ -84,7 +94,7 @@ export class EpochLedger {
   }
 }
 
-// ---------- merkle (EdgeDistributor-compatible) ----------
+// ---------- merkle (DiamondDistributor-compatible) ----------
 export const leafOf = (epochId, account, amount) => ethers.keccak256(ethers.concat([
   ethers.keccak256(ethers.AbiCoder.defaultAbiCoder()
     .encode(["uint256", "address", "uint256"], [epochId, account, amount]))]));

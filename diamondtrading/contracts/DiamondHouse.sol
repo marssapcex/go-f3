@@ -1,23 +1,24 @@
 // SPDX-License-Identifier: MIT
-// DiamondHouse v2 — queue-bounded payout house ("pool-zero playable").
+// DiamondHouse v3 — transparent FIFO payout house ("pool-zero playable", papertrade-lineage).
 //
-// NO full-reserve gate: tickets sell even when pool = 0.
+// NO full-reserve gate, NO queue brake, NO pause: tickets sell even when pool = 0,
+// regardless of outstanding debt. The queue is a PUBLIC ledger of what the house owes:
 //   - stake is the player's money: returned immediately on settle (any outcome).
-//   - profit = (M−1)·S, fee = ρ·profit withheld at settle (ρ = 2% of profit).
+//   - profit = (M−1)·S, fee = ρ·profit withheld at settle (ρ = 2% of profit, haircut only).
 //   - WIN while queue empty: net profit paid from pool up to what pool holds, rest queues.
 //   - WIN while queue has debt: entire net profit appends to FIFO (no jumping the line).
-//   - losses & fees: land in sideBucket while queueDebt > 0 and pay the queue FIFO;
-//     only when the queue is clean do they become pool money.
-//   - harvest(n): permissionless FIFO payout, n-bounded (≤64) against gas griefing;
-//     settleWithProof pays up to INLINE_HARVEST (=4) entries inline.
-//   - sales halt when queueDebt ≥ maxQueueDebt (QMAX) or when per-ticket profit
-//     would exceed its class profit cap.
+//   - losses go STRAIGHT to pool (papertrade rule); every settle pays up to
+//     INLINE_HARVEST (=4) queue entries from pool inline, harvest(n≤64) anyone.
+//   - claimInfo(ticketId): position in line + amount owed — the frontend shows the user
+//     exactly where they stand (and should surface nothing when debt = 0).
 //   - distributions to stakers allowed only with an empty queue and only out of the
 //     slice of pool above TARGET_POOL (launch split 80/20, retained share stays pooled).
+//   - no pause switch anywhere: fully permissoinless settlement path; owner can only
+//     tune menu config (class caps), never gate user funds.
 //
 // Money-lane invariant (checked in tests after every op):
-//   USDC.balanceOf(this) == pool + sideBucket + openStakes          (cash lanes)
-//   queueDebt == Σ queued unpaid profits                            (liability lane)
+//   USDC.balanceOf(this) == pool + openStakes                       (cash lanes)
+//   queueDebt == Σ queued unpaid profits                            (public liability)
 pragma solidity 0.8.26;
 
 interface IERC20Min {
@@ -82,21 +83,16 @@ contract DiamondHouse {
     uint256 public constant LP_LOCK = 7 days;
     uint256 public constant INLINE_HARVEST = 4;
     uint256 public constant HARVEST_MAX = 64;
-    uint256 public constant QMAX_HARD_CEILING = 5_000_000e6; // absolute governance bound on QMAX
 
     // ---------------- state ----------------
     address public owner;
     address public quoterSigner;
     address public outcomeVerifier;
     address public revenueSink;
-    bool    public salesPaused;
 
-    uint256 public pool;        // house lane
-    uint256 public sideBucket;  // queue-paying lane (losses+fees while in debt)
+    uint256 public pool;        // house lane (loses land here directly)
     uint256 public openStakes;  // player lane (unsettled stakes)
-    uint256 public queueDebt;   // Σ unpaid queued profits
-
-    uint256 public maxQueueDebt = 1_000_000e6; // QMAX — sales halt at/above this
+    uint256 public queueDebt;   // Σ unpaid queued profits (public debt)
     uint256 public targetPool   = 500_000e6;   // waterfall threshold
     uint256 public constant STAKER_SHARE_BPS = 8_000; // 80% of (pool − targetPool) is distributable
 
@@ -125,7 +121,6 @@ contract DiamondHouse {
     event Dequeued(uint256 indexed entryId, address owner, uint256 amount);
     event ClassSet(uint8 classId, uint32 maxMult, uint64 profitCap, bool enabled);
     event ParamSet(string what, uint256 value);
-    event SalesPaused(bool on);
     event LpDeposit(address indexed lp, uint256 amount, uint256 shares);
     event LpExitRequested(address indexed lp, uint256 shares, uint64 availableAt);
     event LpWithdrawn(address indexed lp, uint256 amount);
@@ -147,17 +142,32 @@ contract DiamondHouse {
 
     /// Cash-lane invariant: every wei in the contract belongs to exactly one lane.
     function lanesIntact() public view returns (bool) {
-        return balance() == pool + sideBucket + openStakes;
+        return balance() == pool + openStakes;
     }
     function liveQueueEntries() public view returns (uint256) {
         return payoutQueue.length - queueHead;
+    }
+
+    /// User-facing queue transparency: where does this ticket stand and what is it owed?
+    /// position = 0 when nothing is queued for this ticket; otherwise 1 = next to be paid.
+    mapping(uint256 => uint256) public queueOf; // ticketId → entryId+1 (0 = never queued)
+
+    function claimInfo(uint256 ticketId) external view returns (
+        bool hasDebt, uint256 amountOwed, uint256 position, uint256 totalDebt
+    ) {
+        uint256 ref = queueOf[ticketId];
+        totalDebt = queueDebt;
+        if (ref == 0) return (false, 0, 0, totalDebt);
+        uint256 entryId = ref - 1;
+        QueueEntry storage e = payoutQueue[entryId];
+        if (e.amount == 0) return (false, 0, 0, totalDebt);
+        return (true, uint256(e.amount), entryId - queueHead + 1, totalDebt);
     }
 
     // ---------------- sales (v2: no solvency gate) ----------------
     function buyTicket(Quote calldata q, bytes calldata sig, uint32 minMultX1e4, uint64 ttl)
         external nonReentrant returns (uint256 id)
     {
-        require(!salesPaused, "sales halted");
         require(ttl == 30 || ttl == 60 || ttl == 120 || ttl == 300, "bad ttl");
         require(q.validUntil >= block.timestamp, "quote expired");
         require(q.validUntil <= block.timestamp + QUOTE_TTL, "quote too far ahead");
@@ -178,7 +188,6 @@ contract DiamondHouse {
         uint256 profit = uint256(q.multX1e4 - 10_000) * stake / 10_000; // (M−1)·S
         require(stake > 0, "zero stake");
         require(profit <= cc.profitCap, "profit over class cap");       // static per-ticket line
-        require(queueDebt < maxQueueDebt, "queue saturated (QMAX)");    // v2 sales brake
 
         require(usdc.transferFrom(msg.sender, address(this), stake), "pay in");
         openStakes += stake;
@@ -236,13 +245,12 @@ contract DiamondHouse {
             t.queuedProfit = uint128(profitQueued);
             require(usdc.transfer(t.owner, S + profitPaid), "pay out");
         } else if (o == Outcome.KNOCKED) {
-            if (queueDebt > 0) sideBucket += S; else pool += S;
+            pool += S;                 // papertrade rule: loser money feeds the house pot directly
             stakeBack = 0;
-        } else { // EXPIRED: rebate 15% of stake, rest feeds queue or pool
+        } else { // EXPIRED: rebate 15% of stake, rest to pool
             uint256 rebate = S * REBATE_BPS / BPS;
             stakeBack = rebate;
-            uint256 rest = S - rebate;
-            if (queueDebt > 0) sideBucket += rest; else pool += rest;
+            pool += S - rebate;
             require(usdc.transfer(t.owner, rebate), "rebate out");
         }
 
@@ -267,24 +275,23 @@ contract DiamondHouse {
     function _enqueue(address who, uint256 amount, uint64 ticketId) internal {
         payoutQueue.push(QueueEntry({ owner: who, amount: uint128(amount), ticketId: ticketId }));
         queueDebt += amount;
+        queueOf[ticketId] = payoutQueue.length; // entryId+1 for claimInfo()
         emit Queued(payoutQueue.length - 1, ticketId, who, amount);
     }
 
     function _payQueue(uint256 maxN) internal {
         uint256 n = maxN;
-        while (n > 0 && queueHead < payoutQueue.length && sideBucket > 0) {
+        while (n > 0 && queueHead < payoutQueue.length && pool > 0) {
             QueueEntry storage e = payoutQueue[queueHead];
-            uint256 pay = e.amount > sideBucket ? sideBucket : e.amount;
+            uint256 pay = e.amount > pool ? pool : e.amount;
             e.amount -= uint128(pay);
-            sideBucket -= pay;
-            queueDebt  -= pay;
+            pool -= pay;
+            queueDebt -= pay;
             require(usdc.transfer(e.owner, pay), "queue out");
             emit Dequeued(queueHead, e.owner, pay);
             if (e.amount == 0) queueHead++;
             n--;
         }
-        // sweep: once the queue is clean, leftover losses/fees become pool money (§4-v2)
-        if (queueDebt == 0 && sideBucket > 0) { pool += sideBucket; sideBucket = 0; }
     }
 
     /// Permissionless FIFO harvest. n ≤ HARVEST_MAX keeps gas bounded.
@@ -353,10 +360,6 @@ contract DiamondHouse {
         classCfg[classId] = ClassCfg(maxMult2, profitCap, enabled);
         emit ClassSet(classId, maxMult2, profitCap, enabled);
     }
-    function setMaxQueueDebt(uint256 q) external onlyOwner {
-        require(q <= QMAX_HARD_CEILING, "qmax ceiling");
-        maxQueueDebt = q; emit ParamSet("maxQueueDebt", q);
-    }
     function setTargetPool(uint256 tp) external onlyOwner { targetPool = tp; emit ParamSet("targetPool", tp); }
     function setQuoter(address qa) external onlyOwner { require(qa != address(0), "zero"); quoterSigner = qa; emit ParamSet("quoter", uint256(uint160(qa))); }
     function setOutcomeVerifier(address v) external onlyOwner { require(v != address(0), "zero"); outcomeVerifier = v; emit ParamSet("verifier", uint256(uint160(v))); }
@@ -365,7 +368,6 @@ contract DiamondHouse {
         require(usdc.approve(s, type(uint256).max), "approve");
         emit ParamSet("revenueSink", uint256(uint160(s)));
     }
-    function pauseSales(bool p) external onlyOwner { salesPaused = p; emit SalesPaused(p); }
 
     // ---------------- sig plumbing ----------------
     function _recoverSig(bytes32 digest, bytes calldata sig) internal pure returns (address) {
