@@ -12,7 +12,7 @@ const { MockVenue } = require("../engine/venues/mock.js");
 const { routeAsset, payoutCeiling, SpikeBreaker } = require("../engine/caps.js");
 const { bustProb, offerMultiplier, clampMultiplier } = require("../engine/pricer.js");
 const { Quoter, Attester, agreePrice } = require("../engine/quoter.js");
-const { EpochLedger, buildMerkle, signRevenueAnchor, rateBps } = require("../engine/ledger.js");
+const { EpochLedger, buildMerkle, signRevenueAnchor, projectedRate, LAUNCH_RATE_BPS } = require("../engine/ledger.js");
 
 const U = (n) => BigInt(n) * 10n ** 6n;
 const E18 = (n) => BigInt(n) * 10n ** 18n;
@@ -48,8 +48,12 @@ async function algos() {
     ok(Math.abs(c2 - 1_000) < 1, `thin-venue ceiling = ${c2} (λ floor)`);
     const c4 = payoutCeiling({ lambdaUsdPerSec: 400, omegaSec: 10, dualRead: true });
     ok(Math.abs(c4 - 400 * 10 / 3) < 1e-6, "dual-read relaxes κ to 1/3");
-    ok(rateBps(0) === 20000 && rateBps(360) === 3000 && rateBps(999) === 3000,
-        "mint schedule r(e): 200% → 30% floor at epoch 360");
+    // v3 adaptive mint rate (counter-cyclical): mirror of DiamondDistributor
+    ok(LAUNCH_RATE_BPS === 20000, "mint launch rate = 200% (bait)");
+    ok(projectedRate(20000, null, 0n) === 20000, "first epoch keeps launch rate");
+    ok(projectedRate(20000, 100n, 200n) === 19750, "growth tightens −250bps");
+    ok(projectedRate(20000, 200n, 100n) === 20000, "weakness eases +1000bps (ceiling-capped)");
+    ok(projectedRate(3100, 1n, 2n) === 3000, "floor 30% pin");
 
     // G4 breaker
     const br = new SpikeBreaker({ mult: 4, coolMs: 60_000 });
@@ -165,10 +169,10 @@ async function interop() {
   ok(agr !== null, "dual venues agree within tolerance -> signable");
   ok(agreePrice(78.39, 78.55) === null, "dual venues 20bp apart -> NO-SIGN");
 
-  // --- ledger smart-mint -> EdgeDistributor end-to-end
-  const edge = await (await C("EdgeToken", owner).deploy()).waitForDeployment();
-  const dist = await (await C("EdgeDistributor", owner).deploy(await edge.getAddress())).waitForDeployment();
-  await (await edge.setMinter(await dist.getAddress())).wait();
+  // --- ledger smart-mint -> DiamondDistributor end-to-end
+  const diamond = await (await C("DiamondToken", owner).deploy()).waitForDeployment();
+  const dist = await (await C("DiamondDistributor", owner).deploy(await diamond.getAddress())).waitForDeployment();
+  await (await diamond.setMinter(await dist.getAddress())).wait();
   await (await dist.setBudgetAttester(budgeter.address)).wait();
 
   const epochMs = 6 * 3600 * 1000;
@@ -198,24 +202,25 @@ async function interop() {
   ok(a1 > 0n && a2 > a1, "loyal bigger-loser earns more");
   ok(Math.abs(Number(a2) / Number(a1) - w2 / w1) < 0.01, "weights follow √(loss×fees)×loyalty");
 
-  const late = L.mintAmounts(500, { loyaltySet: new Set([b2.address]), priceX1e8: 1_000_000n });
-  ok(late.budget <= late.anchor * 3_000n / 10_000n * 10n ** 20n / 1_000_000n + 10n,
-      "epoch 500: budget ≤ 30% floor × anchor (schedule cooled)");
-  ok(late.budget === 2_000_000n * 10n ** 18n || late.budget < (2_000_000n * 10n ** 18n),
-      "absolute epoch cap bounds every epoch");
+  const tight = L.mintAmounts(500, { loyaltySet: new Set([b2.address]), priceX1e8: 1_000_000n, rateBps: 3000 });
+  ok(tight.budget <= tight.anchor * 3_000n / 10_000n * 10n ** 20n / 1_000_000n + 10n &&
+     tight.budget === tight.anchor * 3_000n / 10_000n * 10n ** 20n / 1_000_000n,
+      "tightened regime (30%) shrinks the budget linearly");
+  ok(tight.budget <= 2_000_000n * 10n ** 18n && mm.budget <= 2_000_000n * 10n ** 18n,
+      "absolute epoch cap bounds every regime");
 
   const mk = buildMerkle(1, mm.amounts);
   const anchorSig = await signRevenueAnchor(budgeter, 1n, mm.anchor, mm.priceX1e8);
   await (await dist.postEpoch(1, mk.root, mm.total, mm.anchor, mm.priceX1e8, anchorSig)).wait();
-  ok(true, "engine merkle root + anchor accepted by EdgeDistributor");
+  ok(true, "engine merkle root + anchor accepted by DiamondDistributor");
 
   const proof1 = mk.proofOf(b1.address);
   await (await dist.connect(b1).claim(1, mm.amounts.get(b1.address), proof1)).wait();
-  ok((await edge.balanceOf(b1.address)) === mm.amounts.get(b1.address),
-      "b1 claimed engine-weighted EDGE on-chain");
+  ok((await diamond.balanceOf(b1.address)) === mm.amounts.get(b1.address),
+      "b1 claimed engine-weighted DIAMOND on-chain");
   const proof2 = mk.proofOf(b2.address);
   await (await dist.connect(b2).claim(1, mm.amounts.get(b2.address), proof2)).wait();
-  ok((await edge.balanceOf(b2.address)) === mm.amounts.get(b2.address),
+  ok((await diamond.balanceOf(b2.address)) === mm.amounts.get(b2.address),
       "b2 claimed with sorted-pair proof");
   ok(mk.leaves.length === 2, "tree contains exactly the two eligible losers");
 

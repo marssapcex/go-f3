@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
-/// @title EDGE — loss-receipt token for DiamondTrading (v2: bootstrap transfer guard).
+/// @title DIAMOND — loss-receipt token of DiamondTrading (bootstrap transfer guard).
 /// @notice Capped ERC20, minting restricted to the distributor (no house cursor can touch supply).
 ///         v2 adds a bootstrap transfer lock: while `transfersEnabled == false` tokens can move
 ///         only to/from allowlisted protocol contracts (stake/unstake/claim paths) or be burned.
 ///         This kills farm-exit during bootstrap: farmed tokens cannot be sold, only staked.
 ///         `enableTransfers()` is one-way and irreversible.
-contract EdgeToken {
-    string public constant name = "Diamond EDGE";
-    string public constant symbol = "EDGE";
+contract DiamondToken {
+    string public constant name = "DiamondToken";
+    string public constant symbol = "DIAMOND";
     uint8 public constant decimals = 18;
     uint256 public constant CAP = 1_000_000_000e18;
 

@@ -1,11 +1,11 @@
-// DiamondTrading v2 property fuzz — queue-bounded payout invariants.
+// DiamondTrading v3 property fuzz — transparent FIFO queue invariants (no brake, no pause).
 // Mirror-lane design: every successful op updates a JS shadow of ALL money lanes;
 // after EVERY op we assert on-chain == shadow:
 //   G1  pool / sideBucket / openStakes / queueDebt exact mirror
-//   G2  lanesIntact(): B == pool + side + open (on-chain view)
+//   G2  lanesIntact(): B == pool + open (on-chain view)
 //   G3  WON while debt>0 ⇒ full net profit queued (no cut-in-line); else pool pays min(pool,net)
 //   G4  FIFO: Dequeued entry ids strictly increasing (oldest first)
-//   G5  sales revert iff queueDebt ≥ QMAX (and while paused)
+//   G5  sales NEVER blocked by queue size (v3: no QMAX); only class cap / quote rules bind
 //   G6  distribute only when queue clean and pool > target; exact amount leaves
 // Deterministic: SEED / OPS env-tunable.
 const { ethers } = require("ethers");
@@ -90,19 +90,17 @@ const FEE_BPS = 200n, BPS = 10_000n;
   const H = (s) => house.connect(s);
 
   // ---- shadow lanes ----
-  let sh = { pool: 0n, side: 0n, open: 0n, debt: 0n };
+  let sh = { pool: 0n, open: 0n, debt: 0n };
   let totalShares = 0n;
   const queue = [];         // shadow {entryId(owner, amount, ticketId)} — head is queue[0]
   let entrySeq = 0, lastDeqId = -1;
   const open = [];          // { id, buyer, stake, mult, expiry }
-  let paused = false;
   let checks = 0, buysOk = 0, settleOk = 0, refunds = 0, harvests = 0, dists = 0, reverts = 0, deqTotal = 0;
 
   function laneCheck(tag) {
-    return Promise.all([house.pool(), house.sideBucket(), house.openStakes(), house.queueDebt(), house.lanesIntact()])
-      .then(([p, s, o, d, lanes]) => {
+    return Promise.all([house.pool(), house.openStakes(), house.queueDebt(), house.lanesIntact()])
+      .then(([p, o, d, lanes]) => {
         if (p !== sh.pool) throw new Error(`G1 pool drift @${tag}: chain ${p} vs shadow ${sh.pool}`);
-        if (s !== sh.side) throw new Error(`G1 side drift @${tag}: chain ${s} vs shadow ${sh.side}`);
         if (o !== sh.open) throw new Error(`G1 open drift @${tag}: chain ${o} vs shadow ${sh.open}`);
         if (d !== sh.debt) throw new Error(`G1 debt drift @${tag}: chain ${d} vs shadow ${sh.debt}`);
         if (!lanes) throw new Error(`G2 lane break @${tag}`);
@@ -126,10 +124,10 @@ const FEE_BPS = 200n, BPS = 10_000n;
       validUntil: (await now()) + 25, salt: ethers.hexlify(ethers.randomBytes(32)), buyer: buyer.address };
     const sig = await quoter.signTypedData(qDomain, qTypes, q);
     const { net } = np(stake, mult);
-    const mustFail = (paused || sh.debt >= (await house.maxQueueDebt()) || net > U(50_000));
+    const mustFail = (net > U(50_000)); // v3: debt NEVER blocks a sale; class pain cap does
     try {
       const rc = await (await H(buyer).buyTicket(q, sig, mult, ttl)).wait();
-      if (mustFail) throw new Error("G5 violated: sale succeeded while paused / QMAX-saturated / over class cap");
+      if (mustFail) throw new Error("G5 violated: sale succeeded while over class cap");
       const id = rc.logs.find((l) => l.fragment?.name === "Sold").args[0];
       open.push({ id, buyer, stake, mult, expiry: (await now()) + ttl });
       sh.open += stake; buysOk++;
@@ -148,13 +146,11 @@ const FEE_BPS = 200n, BPS = 10_000n;
       if (!head || queue.indexOf(head) !== 0) throw new Error(`G4 violated: paid entry ${entryId} out of FIFO order`);
       if (amt > head.amount) throw new Error(`G4 overpay entry ${entryId}`);
       head.amount -= amt;
-      sh.side -= amt; sh.debt -= amt;
+      sh.pool -= amt; sh.debt -= amt;
       deqTotal += 1;
       if (head.amount === 0n) queue.shift();
     }
   }
-
-  function sweepShadow() { if (sh.debt === 0n && sh.side > 0n) { sh.pool += sh.side; sh.side = 0n; } }
 
   async function opSettle() {
     if (!open.length) return;
@@ -191,19 +187,16 @@ const FEE_BPS = 200n, BPS = 10_000n;
       const got = (await usdc.balanceOf(t.buyer.address)) - b0;
       if (got !== t.stake + paid + deqToOwner) throw new Error(`G3 payout wrong: id=${t.id} got ${got} expect ${t.stake + paid + deqToOwner}`);
     } else if (o === 2) {
-      if (debtBefore > 0n) sh.side += t.stake; else sh.pool += t.stake;
+      sh.pool += t.stake;            // v3 papertrade rule: losses feed pool directly
       const got = (await usdc.balanceOf(t.buyer.address)) - b0;
       if (got !== deqToOwner) throw new Error(`KNOCKED paid ${got} (expect only their queue payout ${deqToOwner})`);
     } else {
       const rebate = t.stake * 1_500n / BPS;
-      const rest = t.stake - rebate;
-      if (debtBefore > 0n) sh.side += rest; else sh.pool += rest;
+      sh.pool += t.stake - rebate;
       const got = (await usdc.balanceOf(t.buyer.address)) - b0;
       if (got !== rebate + deqToOwner) throw new Error(`EXPIRED rebate wrong: ${got} vs ${rebate + deqToOwner}`);
     }
-    // replay inline harvest into shadow, THEN allow sweep (contract sweeps after paying)
     await payQueueShadow(deq);
-    sweepShadow();
     settleOk++;
   }
 
@@ -223,7 +216,7 @@ const FEE_BPS = 200n, BPS = 10_000n;
     try {
       const rc = await (await H(keeper).harvest(ri(1, 64))).wait();
       await payQueueShadow(rc.logs.filter((l) => l.fragment?.name === "Dequeued"));
-      sweepShadow(); harvests++;
+      harvests++;
     } catch (e) { reverts++; }
   }
 
@@ -237,7 +230,6 @@ const FEE_BPS = 200n, BPS = 10_000n;
     } catch (e) { reverts++; }
   }
 
-  async function opPause() { paused = !paused; await (await H(owner).pauseSales(paused)).wait(); }
 
   async function opDistribute() {
     const d = await house.distributable();
@@ -256,7 +248,7 @@ const FEE_BPS = 200n, BPS = 10_000n;
 
   const bag = [
     [30, opBuy], [24, opSettle], [8, opStall], [6, opHarvest], [10, opLpDeposit],
-    [3, opPause], [5, opDistribute], [14, opWarp],
+    [5, opDistribute], [17, opWarp],
   ].flatMap(([w, f]) => Array(w).fill(f));
 
   let followUp = 0;
@@ -279,21 +271,20 @@ const FEE_BPS = 200n, BPS = 10_000n;
       sh.open -= t.stake;
       const deq = rc.logs.filter((l) => l.fragment?.name === "Dequeued");
       if (o === 3) {
-        const rebate = t.stake * 1_500n / BPS, rest = t.stake - rebate;
-        if (debtBefore > 0n) sh.side += rest; else sh.pool += rest;
+        sh.pool += t.stake - t.stake * 1_500n / BPS;
       } else if (o === 2) {
-        if (debtBefore > 0n) sh.side += t.stake; else sh.pool += t.stake;
+        sh.pool += t.stake;
       } else {
         const { net } = np(t.stake, t.mult);
         const paid = debtBefore > 0n ? 0n : (net > poolBefore ? poolBefore : net);
         sh.pool -= paid;
         if (paid < net) { queue.push({ entryId: entrySeq++, amount: net - paid, ticketId: Number(t.id), owner: t.buyer }); sh.debt += (net - paid); }
       }
-      await payQueueShadow(deq); sweepShadow();
+      await payQueueShadow(deq);
     } catch (e) { reverts++; }
   }
   await laneCheck("teardown");
-  console.log(`fuzz-v2 SEED=${SEED} OPS=${OPS}: OK — ${checks} checks, ${buysOk} buys, ${settleOk} settles,` +
+  console.log(`fuzz-v3 SEED=${SEED} OPS=${OPS}: OK — ${checks} checks, ${buysOk} buys, ${settleOk} settles,` +
     ` ${refunds} stall refunds, ${harvests} harvests, ${deqTotal} FIFO payments (follow-ups ${followUp}),` +
-    ` ${dists} distributions | end: pool=${sh.pool} side=${sh.side} debt=${sh.debt} (${reverts} expected reverts)`);
+    ` ${dists} distributions | end: pool=${sh.pool} debt=${sh.debt} (${reverts} expected reverts)`);
 })().catch((e) => { console.error("FUZZ FAILURE:", e.message); process.exit(1); });
