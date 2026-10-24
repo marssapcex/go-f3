@@ -1,0 +1,22 @@
+{
+  "commandFull": "npm audit --json",
+  "commandOmitDev": "npm audit --omit=dev --json",
+  "automaticFixApplied": false,
+  "full": { "low": 10, "moderate": 6, "high": 27, "critical": 5, "total": 48 },
+  "omitDev": { "low": 2, "moderate": 5, "high": 23, "critical": 5, "total": 35 },
+  "packageEntryTriage": {
+    "ganacheOnlyTrees": 29,
+    "hardhatOnlyTrees": 13,
+    "solcAndTmpTrees": 2,
+    "mixedGanacheAndDevTrees": 4
+  },
+  "notes": [
+    "Counts are vulnerable package entries, not 48 independent protocol exploits or 48 unique advisories.",
+    "The production ethers package has no direct entry in this audit output.",
+    "Ganache is test tooling despite being listed in dependencies; solc 0.8.26 is the retained production compiler.",
+    "Hardhat-only findings are development-toolchain risks. adm-zip and undici advisories require untrusted archive or network input paths not exercised by the in-process audit.",
+    "tmp advisories affect the solc build toolchain; compiler input and local filesystem access are required. solc was not upgraded because the audit intentionally tests 0.8.26 bytecode.",
+    "No dependency advisory was promoted to a protocol vulnerability without a reachable code path and a reproduction."
+  ],
+  "rawResults": ["npm-audit-full.json", "npm-audit-omit-dev.json"]
+}

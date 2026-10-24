@@ -9,11 +9,17 @@
     "test:unit": "node test/diamond.test.js",
     "test:engine": "node test/engine.test.js",
     "test:security": "node test/security.test.js",
-    "test:fuzz": "node test/fuzz.js"
+    "test:fuzz": "node test/fuzz.js",
+    "audit:security": "AUDIT_EVM=hardhat npx hardhat --config audit/hardhat/hardhat.config.cjs run --no-compile test/security.test.js",
+    "audit:pocs": "npx hardhat --config audit/hardhat/hardhat.config.cjs run --no-compile audit/hardhat/attack-pocs.cjs",
+    "audit:fuzz": "npx hardhat --config audit/hardhat/hardhat.config.cjs run --no-compile audit/hardhat/deep-fuzz.cjs"
   },
   "dependencies": {
     "ethers": "^6.17.0",
     "ganache": "^7.9.2",
     "solc": "0.8.26"
+  },
+  "devDependencies": {
+    "hardhat": "2.29.1"
   }
 }
