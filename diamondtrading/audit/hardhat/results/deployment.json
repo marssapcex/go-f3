@@ -1,0 +1,118 @@
+{
+  "rpc": "http://127.0.0.1:8545",
+  "chainId": 31337,
+  "deploymentHouse": "0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9",
+  "menuClassesChecked": 7,
+  "mismatches": [
+    {
+      "classId": 0,
+      "asset": "BTC",
+      "expected": {
+        "enabled": true,
+        "maxMultX1e4": "10000000",
+        "profitCap": "35000000000"
+      },
+      "actual": {
+        "enabled": false,
+        "maxMultX1e4": "0",
+        "profitCap": "0"
+      }
+    },
+    {
+      "classId": 1,
+      "asset": "ETH",
+      "expected": {
+        "enabled": true,
+        "maxMultX1e4": "10000000",
+        "profitCap": "25000000000"
+      },
+      "actual": {
+        "enabled": true,
+        "maxMultX1e4": "10000000",
+        "profitCap": "250000000000"
+      }
+    },
+    {
+      "classId": 2,
+      "asset": "SOL",
+      "expected": {
+        "enabled": true,
+        "maxMultX1e4": "10000000",
+        "profitCap": "15000000000"
+      },
+      "actual": {
+        "enabled": true,
+        "maxMultX1e4": "10000000",
+        "profitCap": "250000000000"
+      }
+    },
+    {
+      "classId": 3,
+      "asset": "HYPE",
+      "expected": {
+        "enabled": true,
+        "maxMultX1e4": "10000000",
+        "profitCap": "15000000000"
+      },
+      "actual": {
+        "enabled": true,
+        "maxMultX1e4": "5000000",
+        "profitCap": "100000000000"
+      }
+    },
+    {
+      "classId": 4,
+      "asset": "BNB",
+      "expected": {
+        "enabled": true,
+        "maxMultX1e4": "10000000",
+        "profitCap": "8000000000"
+      },
+      "actual": {
+        "enabled": true,
+        "maxMultX1e4": "5000000",
+        "profitCap": "50000000000"
+      }
+    },
+    {
+      "classId": 5,
+      "asset": "SP500",
+      "expected": {
+        "enabled": true,
+        "maxMultX1e4": "1000000",
+        "profitCap": "3000000000"
+      },
+      "actual": {
+        "enabled": true,
+        "maxMultX1e4": "2000000",
+        "profitCap": "50000000000"
+      }
+    },
+    {
+      "classId": 6,
+      "asset": "XYZ100",
+      "expected": {
+        "enabled": true,
+        "maxMultX1e4": "1000000",
+        "profitCap": "3000000000"
+      },
+      "actual": {
+        "enabled": true,
+        "maxMultX1e4": "1000000",
+        "profitCap": "25000000000"
+      }
+    }
+  ],
+  "unexpectedClass7": {
+    "enabled": true,
+    "maxMultX1e4": "1000000",
+    "profitCap": "25000000000"
+  },
+  "proof": {
+    "menuBtcClass0Error": "class disabled",
+    "acceptedTicketId": "0",
+    "acceptedClassId": "1",
+    "acceptedProfit": "100000000000",
+    "menuEthCap": "25000000000"
+  }
+}

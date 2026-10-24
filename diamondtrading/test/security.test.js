@@ -1,9 +1,10 @@
 // Security regression suite for the 2026-10-24 audit triage.
-// Runs against the production artifacts on in-process ganache; no Hardhat or vulnerable/fixed
-// artifact mixing. Each finding is checked against the behavior selected for THIS repository:
-// no sweep, no 100% mint-cap change, and queueDebt remains deferred debt rather than LP NAV.
+// Runs against the production artifacts on in-process Ganache by default, or Hardhat when
+// AUDIT_EVM=hardhat. No vulnerable/fixed artifact mixing. Each finding is checked against the
+// behavior selected for THIS repository: no sweep, no 100% mint-cap change, and queueDebt
+// remains deferred debt rather than LP NAV.
 const { ethers } = require("ethers");
-const ganache = require("ganache");
+const ganache = process.env.AUDIT_EVM === "hardhat" ? null : require("ganache");
 const fs = require("fs");
 const path = require("path");
 const { spawn } = require("child_process");
@@ -46,8 +47,10 @@ function malleate(signature) {
 const pairHash = (a, b) => a < b ? ethers.keccak256(ethers.concat([a, b])) : ethers.keccak256(ethers.concat([b, a]));
 
 async function main() {
-  const gprov = ganache.provider({ chain: { chainId: 31337 }, wallet: { totalAccounts: 20 }, logging: { quiet: true } });
-  const provider = new ethers.BrowserProvider(gprov);
+  const useHardhat = process.env.AUDIT_EVM === "hardhat";
+  const gprov = useHardhat ? null : ganache.provider({ chain: { chainId: 31337 }, wallet: { totalAccounts: 20 }, logging: { quiet: true } });
+  const eip1193 = useHardhat ? require("hardhat").network.provider : gprov;
+  const provider = new ethers.BrowserProvider(eip1193);
   const accounts = await provider.listAccounts();
   const [owner, lp, relayer, p1, p2, p3, p4, p5, honest, attacker] = accounts;
   const hd = (i) => ethers.HDNodeWallet.fromPhrase(MNEMONIC, undefined, `m/44'/60'/0'/0/${i}`).connect(provider);

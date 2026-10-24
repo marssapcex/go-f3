@@ -1,0 +1,28 @@
+{
+  "hardhat": "2.29.1",
+  "checksPassed": 24,
+  "checksFailed": 0,
+  "command": "npm run audit:pocs",
+  "facts": {
+    "lateStaker": {
+      "emptyIntervalSeconds": 2592000,
+      "newStakeDiamondWei": "1",
+      "oldNotificationUsdc": "399.000000",
+      "lateStakerReceivedUsdc": "398.999999"
+    },
+    "rollingStream": {
+      "initialNotificationUsdc": "100.000000",
+      "secondNotificationBaseUnits": "1",
+      "claimableAtOriginalFinishUsdc": "87.755244"
+    },
+    "zeroAttester": "After owner enabled address(0), one valid attester signature plus one invalid 65-byte signature met threshold 2.",
+    "earlySettlement": "Two valid attester signatures settled House WON before expiry; this is a documented verifier-trust residual.",
+    "hyperliquid": "Two recentTrades rows at the same millisecond produced one tape print.",
+    "binance": "Five overlapping responses containing the same aggTrade ID produced five tape prints and 10 units of VWAP quantity instead of 2.",
+    "zeroNavRecapitalization": "Old LP recovered 500.0 USDC and a new 1,000-USDC LP recovered 500.0 USDC after zero-NAV recapitalization.",
+    "blockedSink": "A blocked RevenueSplit reverted clean-book WON settlement; disabling the sink recovered settlement with the test token.",
+    "malleability": "High-s quote replay reverted quote used; two encodings of one attester signature did not meet quorum.",
+    "ledgerPrecisionMaxRelativeError": "1.6666597222656267e-15",
+    "zeroQuantityTape": "A zero-quantity print produced NaN VWAP."
+  }
+}

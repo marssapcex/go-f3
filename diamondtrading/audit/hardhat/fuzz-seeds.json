@@ -1,0 +1,10 @@
+{
+  "description": "Deterministic Hardhat state-machine seeds. Replay one failure with FUZZ_SCENARIO=<scenario> FUZZ_SEEDS=<seed> FUZZ_OPS=<operations> npx hardhat --config audit/hardhat/hardhat.config.cjs run --no-compile audit/hardhat/deep-fuzz.cjs.",
+  "operations": 150,
+  "seeds": {
+    "house": [1, 7, 42, 1337, 90210],
+    "options": [3, 11, 43, 1338, 90211],
+    "rewards": [5, 13, 47, 1339, 90212],
+    "distributor": [9, 17, 53, 1340, 90213]
+  }
+}
