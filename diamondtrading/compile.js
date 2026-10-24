@@ -1,12 +1,14 @@
-// Compile runner: solc-js standard-json over contracts/*.sol
+// Compile runner: solc-js standard-json over production contracts and test-only helpers.
 const fs = require("fs");
 const path = require("path");
 const solc = require("solc");
 
-const dir = path.join(__dirname, "contracts");
 const sources = {};
-for (const f of fs.readdirSync(dir).filter((x) => x.endsWith(".sol"))) {
-  sources[f] = { content: fs.readFileSync(path.join(dir, f), "utf8") };
+for (const dir of [path.join(__dirname, "contracts"), path.join(__dirname, "test", "helpers")]) {
+  if (!fs.existsSync(dir)) continue;
+  for (const f of fs.readdirSync(dir).filter((x) => x.endsWith(".sol"))) {
+    sources[f] = { content: fs.readFileSync(path.join(dir, f), "utf8") };
+  }
 }
 
 const input = {

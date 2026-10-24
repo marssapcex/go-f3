@@ -135,7 +135,7 @@ async function interop() {
   const salt = ethers.hexlify(ethers.randomBytes(32));
   const { q, sig } = await Q.signOption({
     classId: 0, dir: 0, premium: U(100), multX1e4: x(3), bandBps: 50,
-    strikeX1e8: K, validUntil: now + 20, salt, buyer: b1.address });
+    strikeX1e8: K, validUntil: now + 20, salt, buyer: b1.address, ttl: 60 });
   const rc = await (await opts.connect(b1).buyOption(q, sig, K, 60)).wait();
   const sold = rc.logs.find((l) => l.fragment?.name === "OSold");
   ok(!!sold, "engine-quoted OQuote passes contract EIP-712 and sells");
@@ -180,10 +180,10 @@ async function interop() {
 
   const now2 = Number((await provider.getBlock("latest")).timestamp);
   const qLose = await Q.signOption({ classId: 0, dir: 0, premium: U(1_000), multX1e4: x(3),
-    bandBps: 50, strikeX1e8: K, validUntil: now2 + 20, salt: ethers.randomBytes(32), buyer: b3.address });
+    bandBps: 50, strikeX1e8: K, validUntil: now2 + 20, salt: ethers.randomBytes(32), buyer: b3.address, ttl: 60 });
   await (await opts.connect(b3).buyOption(qLose.q, qLose.sig, K, 60)).wait(); // id 1
   const qWin = await Q.signOption({ classId: 0, dir: 0, premium: U(100), multX1e4: x(3),
-    bandBps: 50, strikeX1e8: K, validUntil: now2 + 20, salt: ethers.randomBytes(32), buyer: b2.address });
+    bandBps: 50, strikeX1e8: K, validUntil: now2 + 20, salt: ethers.randomBytes(32), buyer: b2.address, ttl: 60 });
   await (await opts.connect(b2).buyOption(qWin.q, qWin.sig, K, 60)).wait();   // id 2
   await provider.send("evm_increaseTime", [75]);
   for (let i = 0; i < 60; i++) { await provider.send("evm_mine", []); }
@@ -201,8 +201,13 @@ async function interop() {
   ok((await usdc.balanceOf(lp1.address)) - founder0 === founderExpected,
       "Options founder receives exactly 0.99% of gross payout");
   ok((await usdc.balanceOf(feeSinkAddr)) - sink0 === stakerExpected &&
-     (await feeSink.claimable(b3.address)) === stakerExpected,
-      "Options staker slice is pull-based and claimable");
+     (await feeSink.claimable(b3.address)) < stakerExpected,
+      "Options staker slice is pull-based and time-streamed");
+  await provider.send("evm_increaseTime", [7 * 86400 + 60]);
+  for (let i = 0; i < 60; i++) await provider.send("evm_mine", []);
+  const optionRewards = await feeSink.claimable(b3.address);
+  ok(optionRewards <= stakerExpected && optionRewards + 2n >= stakerExpected,
+      "Options staker can claim the full slice after the stream");
   ok(await opts.lanesIntact(), "Options lanes intact after fee stream");
 
   // --- G8 two-venue: agree signs, disagree refuses (no signature produced)
@@ -215,6 +220,7 @@ async function interop() {
   const dist = await (await C("DiamondDistributor", owner).deploy(await diamond.getAddress())).waitForDeployment();
   await (await diamond.setMinter(await dist.getAddress())).wait();
   await (await dist.setBudgetAttester(budgeter.address)).wait();
+  const budgetDomain = { chainId: 31337, distributor: await dist.getAddress() };
 
   const epochMs = 6 * 3600 * 1000;
   const L = new EpochLedger({ epochMs });
@@ -231,8 +237,8 @@ async function interop() {
 
   const mm = L.mintAmounts(0, { loyaltySet: new Set([b2.address]), priceX1e8: 1_000_000n });
   const revenue = U(1_000) + U(2_000) + U(1_000) + U(9_000) - (U(500) + U(2_100)); // 10400 edge
-  const expectAnchor = revenue + U(120); // edge + fees 120
-  ok(mm.anchor === expectAnchor, `ledger anchor (fees+edge) = ${mm.anchor}`);
+  const expectAnchor = revenue; // payout is fee-net: adding feeSum would double-count
+  ok(mm.anchor === expectAnchor, `ledger anchor (realized net revenue) = ${mm.anchor}`);
   { const formula = expectAnchor * 20_000n / 10_000n * 10n ** 20n / 1_000_000n;
     ok(mm.total <= mm.budget && mm.budget === 2_000_000n * 10n ** 18n && mm.budget < formula,
       "epoch-0 budget = min(200% × anchor ÷ price, absolute cap) — cap binds here"); }
@@ -251,7 +257,7 @@ async function interop() {
       "absolute epoch cap bounds every regime");
 
   const mk = buildMerkle(1, mm.amounts);
-  const anchorSig = await signRevenueAnchor(budgeter, 1n, mm.anchor, mm.priceX1e8);
+  const anchorSig = await signRevenueAnchor(budgeter, 1n, mm.anchor, mm.priceX1e8, budgetDomain);
   await (await dist.postEpoch(1, mk.root, mm.total, mm.anchor, mm.priceX1e8, anchorSig)).wait();
   ok(true, "engine merkle root + anchor accepted by DiamondDistributor");
 

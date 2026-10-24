@@ -31,5 +31,5 @@
     ],
     "budgeter": "0x08A2DE6F3528319123b25935C92888B16db8913E"
   },
-  "note": "demo only — ganache deterministic mnemonic, DO NOT send real funds"
+  "note": "demo only — public deterministic mnemonic, local chain, DO NOT send real funds"
 }

@@ -4,7 +4,7 @@
 // and re-eases +1000bps per weak epoch (never above 200%). Growth siết, yếu thì nới.
 // Feeds: per-position settled records { owner, stake, payout, feePaid, ts }.
 // Per epoch: net loss per address, weight w = √(netLoss × feesPaid) × loyalty,
-// budget = rate × signed anchor (fees + realized edge — NEVER gross losses),
+// budget = rate × signed anchor (realized net revenue — NEVER gross losses),
 // converted USDC→DIAMOND at the signed reference price, absolute token cap on top.
 // Merkle root/proofs in the EXACT DiamondDistributor format (OZ sorted-pair,
 // leaf = keccak256(concat(keccak256(abi.encode(epochId, account, amount))))).
@@ -51,8 +51,9 @@ export class EpochLedger {
       a.fees += r.feePaid; acc.set(r.owner, a);
       stakeSum += r.stake; paySum += r.payout; feeSum += r.feePaid;
     }
-    const edge = stakeSum > paySum ? stakeSum - paySum : 0n;   // realized house edge (incl. fees)
-    const anchor = feeSum + edge;                              // phí thực thu + edge thực hiện
+    // payout is already net of fees, so stake − payout includes them exactly once.
+    const edge = stakeSum > paySum ? stakeSum - paySum : 0n;
+    const anchor = edge;                                      // realized net revenue; no fee double-count
     return { acc, revenue: edge, fees: feeSum, anchor };
   }
 
@@ -70,7 +71,7 @@ export class EpochLedger {
   }
 
   /** Budget-capped pro-rata mint (DIAMOND 18dp BigInt).
-   *  anchor: USDC(6dp) realized fees+edge, signed by budgetAttester WITH the price.
+   *  anchor: USDC(6dp) realized net revenue, signed by budgetAttester WITH the price.
    *  priceX1e8: USDC-per-DIAMOND reference (x1e8). tokenBudget = anchor × r(e)/1e4 × 1e20/price,
    *  then clamped by the absolute epoch cap. */
   mintAmounts(epochId, { priceX1e8 = 1_000_000n /* $0.01 */, rateBps = LAUNCH_RATE_BPS, ...wopts } = {}) {
@@ -129,10 +130,14 @@ export function buildMerkle(epochId, entries /* Map<address, amount> | [[address
   return { root, proofOf, leaves: arr.map((e) => ({ account: e.account, amount: e.amount })) };
 }
 
-/** budgetAttester signs the revenue anchor + reference price: EIP-191 personal_sign over
- *  keccak256(abi.encode(epochId, anchorUsd, priceX1e8)) — mirror of EdgeDistributor.postEpoch v2. */
-export function signRevenueAnchor(wallet, epochId, anchorUsd, priceX1e8) {
+/** EIP-191 over keccak256(abi.encode(chainId, distributor, epochId, anchorUsd, priceX1e8)).
+ *  Domain is mandatory so a budget signature cannot be replayed across chains/deployments. */
+export function signRevenueAnchor(wallet, epochId, anchorUsd, priceX1e8, domain) {
+  if (!domain || domain.chainId === undefined || !domain.distributor) {
+    throw new Error("signRevenueAnchor: domain {chainId, distributor} is required");
+  }
   const h = ethers.keccak256(ethers.AbiCoder.defaultAbiCoder()
-    .encode(["uint256", "uint256", "uint256"], [epochId, anchorUsd, priceX1e8]));
+    .encode(["uint256", "address", "uint256", "uint256", "uint256"],
+            [domain.chainId, domain.distributor, epochId, anchorUsd, priceX1e8]));
   return wallet.signMessage(ethers.getBytes(h));
 }
