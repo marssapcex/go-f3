@@ -1,0 +1,33 @@
+
+
+  F-11 head-of-line DoS via blocklisted payee [set=vulnerable]
+  [EVIDENCE] queue: p1 & p2 owed 192.02 USDC total
+  [EVIDENCE] settle(KNOCKED) of an unrelated ticket → blocked
+  [EVIDENCE] harvest(4) → blocked; pool=1000
+    ✔ blocked queue head halts all settlements while pool > 0 (871ms)
+
+  F-12 zero-amount queue entries & unset budget attester [set=vulnerable]
+  [EVIDENCE] 1-wei WON ticket: buy → OK, settle → OK; queue entries 1 → 2
+    ✔ (a) a 1-wei winning ticket with queueDebt>0 pushes a zero-amount queue entry (122ms)
+  [EVIDENCE] postEpoch(epoch 1, 65-byte zero sig, budgetAttester unset) → OK
+    ✔ (b) postEpoch accepts an all-zero signature while budgetAttester is unset (95ms)
+
+  F-13 revenue stranded when no staker exists [set=vulnerable]
+  [EVIDENCE] totalStaked = 0, distributable = 8000 USDC
+  [EVIDENCE] distributeRevenue(1000 USDC) with no stakers → OK; sink USDC = 1000
+  [EVIDENCE] late staker claimable = 0 (stranded USDC in sink = 1000)
+    ✔ owner distributes revenue to an empty staking set; USDC is stranded forever (104ms)
+
+  F-14 anchor double-counts fees and the hedge farm is profitable [engine]
+  [EVIDENCE] realized house P&L (edge, fees already withheld) = 200 USDC
+  [EVIDENCE] anchor used for the mint budget                 = 600 USDC
+    ✔ ledger anchor vs realized house P&L on the reference epoch (103ms)
+  [EVIDENCE] M      cost(USD)  anchor(USD)  rate    DIAMOND→USD   farmer net
+  [EVIDENCE] 1.92   1166.12    1533.24      200%    3066.48       1900.36
+  [EVIDENCE] 1.99   494.05     889.10       200%    1778.20       1284.15
+    ✔ self-funded hedge pair at M = 1.92 / 1.99: farmer's USD cost vs DIAMOND minted at launch rate
+
+
+  6 passing (1s)
+
+EXIT=0

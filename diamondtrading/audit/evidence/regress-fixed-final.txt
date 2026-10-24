@@ -1,0 +1,127 @@
+
+> diamondtrading@0.2.0 audit:regress
+> node audit/lib/build.js && AUDIT_SET=fixed npx hardhat --config audit/hardhat.config.js test audit/test/*.test.js
+
+build[fixed]: 8 contracts from 7 files
+build[vulnerable]: 8 contracts from 7 files
+build[helpers]: 1 contracts from 1 files
+audit build: success
+
+
+  F-01 donation freeze [set=fixed]
+  [EVIDENCE] attacker p5 sent 1 wei USDC to House. lanesIntact()=true
+  [EVIDENCE] buyTicket by honest p2            → OK
+  [EVIDENCE] settleWithProof(id, KNOCKED)      → OK
+  [EVIDENCE] harvest(1)                        → OK
+  [EVIDENCE] lpWithdraw() after 7d lock        → OK
+  [EVIDENCE] refundAfterStall(unsettled id) after stall → OK
+  [EVIDENCE] fixed: surplus (donation) in House = 1 wei; owed = 10000001
+    ✔ House: 1-wei donation freezes buy / settle / harvest / refund / LP exit (903ms)
+  [EVIDENCE] Options.buyOption after donation  → OK
+    ✔ Options: 1-wei donation blocks new option sales and settlement (145ms)
+
+  F-02 JIT stake reward theft [set=fixed]
+  [EVIDENCE] fee streamed to stakers (rewardIndex delta) ≈ 399 USDC
+  [EVIDENCE] attacker (90k DIAMOND, staked 0s) claimable=0 paid=593 (base units, 6dp)
+  [EVIDENCE] honest (10k DIAMOND, staked since genesis) earned=398998812 (base units, 6dp) after the 7d stream
+  [EVIDENCE] attacker share of the single fee event = 0.00%
+    ✔ attacker staking 9x the honest stake right before a fee event takes ~90% of the fee (148ms)
+
+  F-03 distributor claims unbounded by budget [set=fixed]
+  [EVIDENCE] signed anchor=$100, price=$0.01 → on-chain budget = 10000.0 DIAMOND
+  [EVIDENCE] postEpoch(totalMint=10000.0 DIAMOND) accepted
+  [EVIDENCE] attacker claim(1,000,000 DIAMOND) → epoch budget exhausted; attacker balance = 0.0 DIAMOND
+  [EVIDENCE] dist.totalMinted = 0.0 DIAMOND vs epoch budget 10000.0
+    ✔ owner posts totalMint=20,000 DIAMOND (within budget) but the root pays attacker 1,000,000 (110ms)
+
+  F-04 orphan pool capture [set=fixed]
+  [EVIDENCE] pool after loss = 1000000000 (6dp), totalShares = 0
+  [EVIDENCE] attacker lpDeposit(1 wei) → dust; shares = 0
+    ✔ 1-wei LP deposit into an orphaned pool withdraws the whole pool after the 7-day lock (112ms)
+
+  F-05 LP share inflation [set=fixed]
+  [EVIDENCE] pool after attacker's losing bets = 4999000001 (6dp)
+  [EVIDENCE] victim deposit 2,999 USDC → OK; victim shares=2998999, attacker shares=1000000
+  [EVIDENCE] attacker cost = 2000 USDC (lost bets) + 1 wei, received = 1000.0002 USDC → net -999.999801 USDC
+  [EVIDENCE] victim deposited 2999 USDC, received 2998.999601 USDC → net -0.000399 USDC
+    ✔ attacker (1 share) inflates NAV with losing bets; victim's deposit rounds to 1 share (124ms)
+
+  F-06 LP exit subordinates the queue [set=fixed]
+  [EVIDENCE] queueDebt after 5 wins with empty pool = 480050000 (6dp), pool = 0
+  [EVIDENCE] after LP deposit 100: pool=100000000, queueDebt=480050000
+  [EVIDENCE] lpWithdraw → nav empty, LP received 0 USDC
+  [EVIDENCE] remaining queueDebt owed to winners = 480050000 (6dp), pool = 100000000
+    ✔ LP withdraws its 100 USDC while winners' profit is still owed (159ms)
+
+  F-07 public deployment keys [set=fixed]
+    - PoC (vulnerable): anyone holding the public mnemonic can quote a 50x ticket and attest it WON
+  [EVIDENCE] deploy.js (no keys, no DEMO_KEYS) → exit 2: deploy refused: no signing keys (missing env: QUOTER_KEY, ATTESTER_KEY_1, ATTESTER_KEY_2, ATTESTER_KEY_3, BUDGETER_KEY); set them or use DEMO_KEYS=1 on a local chain
+    ✔ fixed: deploy.js refuses to run without explicit keys (exit 2, no demo fallback) (110ms)
+  [EVIDENCE] deploy.js (DEMO_KEYS=1, chainId 1) → exit 2: deploy refused: DEMO_KEYS=1 is only allowed on local chains (got chainId 1)
+    ✔ fixed: DEMO_KEYS=1 is refused on a non-local chain (public mnemonic never signs on a real network) (127ms)
+
+  F-08 owner-controlled drain via approvals [set=fixed]
+  [EVIDENCE] House holds 102000 USDC (pool 100,000 + open player stake 2,000)
+  [EVIDENCE] owner.setRevenueSink(EOA) → sink must be a contract
+  [EVIDENCE] EOA.transferFrom(House → EOA, all) → allowance; EOA gained 0 USDC
+  [EVIDENCE] fixed: allowance House→previous sink after rotation = 0
+    ✔ owner points revenueSink at an EOA: the EOA drains House, including open player stakes (213ms)
+
+  F-09 ttl is unsigned (duration arbitrage) [set=fixed]
+  [EVIDENCE] same signed quote: buy(ttl=30) → ttl mismatch, buy(ttl=300) → ttl mismatch
+    ✔ the same quote is accepted with ttl=30 and ttl=300 (vulnerable) — expiry is buyer's choice (102ms)
+  [EVIDENCE] buyer EV per unit stake when quote = τ60 price and ttl is chosen by buyer:
+  σ/s      ttl   M_offer   P(win)   buyerEV
+  0.0002   30    1.994     0.639    27.4%
+  0.0002   60    1.994     0.481    -4.0%
+  0.0002   120   1.994     0.352    -29.8%
+  0.0002   300   1.994     0.227    -54.7%
+  0.0004   30    3.793     0.352    33.5%
+  0.0004   60    3.793     0.253    -4.0%
+  0.0004   120   3.793     0.181    -31.5%
+  0.0004   300   3.793     0.115    -56.5%
+  0.0008   30    7.489     0.181    35.2%
+  0.0008   60    7.489     0.128    -4.0%
+  0.0008   120   7.489     0.091    -32.0%
+  0.0008   300   7.489     0.058    -56.9%
+  [EVIDENCE] at σ=0.0004: ttl=60 → EV -4.0%; ttl=30 → EV 33.5% (house pays the difference)
+    ✔ economic impact at τ=60 pricing (engine/pricer.js, same σ fallback as engine/index.js)
+
+  F-10 quote replay [set=fixed]
+  [EVIDENCE] 5 purchases with one quote → OK, quote used, quote used, quote used, quote used
+  [EVIDENCE] accepted 1/5 tickets (aggregate exposure 5 × 10 stake at one stale price)
+    ✔ one signed quote buys N tickets inside its validity window (112ms)
+
+  F-11 head-of-line DoS via blocklisted payee [set=fixed]
+  [EVIDENCE] queue: p1 & p2 owed 192.02 USDC total
+  [EVIDENCE] settle(KNOCKED) of an unrelated ticket → OK
+  [EVIDENCE] harvest(4) → OK; pool=817.98
+    ✔ blocked queue head halts all settlements while pool > 0 (136ms)
+
+  F-12 zero-amount queue entries & unset budget attester [set=fixed]
+  [EVIDENCE] 1-wei WON ticket: buy → OK, settle → OK; queue entries 1 → 1
+    ✔ (a) a 1-wei winning ticket with queueDebt>0 pushes a zero-amount queue entry (112ms)
+  [EVIDENCE] postEpoch(epoch 1, 65-byte zero sig, budgetAttester unset) → no budget attester
+    ✔ (b) postEpoch accepts an all-zero signature while budgetAttester is unset (95ms)
+
+  F-13 revenue stranded when no staker exists [set=fixed]
+  [EVIDENCE] totalStaked = 0, distributable = 8000 USDC
+  [EVIDENCE] distributeRevenue(1000 USDC) with no stakers → OK; sink USDC = 1000
+  [EVIDENCE] late staker claimable = 0 (stranded USDC in sink = 1000)
+  [EVIDENCE] fixed: late staker claimable after 7d stream = 999.999999 USDC
+    ✔ owner distributes revenue to an empty staking set; USDC is stranded forever (108ms)
+
+  F-14 anchor double-counts fees and the hedge farm is profitable [engine]
+  [EVIDENCE] realized house P&L (edge, fees already withheld) = 200 USDC
+  [EVIDENCE] anchor used for the mint budget                 = 200 USDC
+    ✔ ledger anchor vs realized house P&L on the reference epoch (98ms)
+  [EVIDENCE] M      cost(USD)  anchor(USD)  rate    DIAMOND→USD   farmer net
+  [EVIDENCE] 1.92   1166.12    1166.12      100%    1166.12       -0.00
+  [EVIDENCE] 1.99   494.05     494.05       100%    494.05        0.00
+    ✔ self-funded hedge pair at M = 1.92 / 1.99: farmer's USD cost vs DIAMOND minted at launch rate
+
+
+  19 passing (3s)
+  1 pending
+
+EXIT=0

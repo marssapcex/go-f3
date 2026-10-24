@@ -49,10 +49,10 @@ async function algos() {
     const c4 = payoutCeiling({ lambdaUsdPerSec: 400, omegaSec: 10, dualRead: true });
     ok(Math.abs(c4 - 400 * 10 / 3) < 1e-6, "dual-read relaxes κ to 1/3");
     // v3 adaptive mint rate (counter-cyclical): mirror of DiamondDistributor
-    ok(LAUNCH_RATE_BPS === 20000, "mint launch rate = 200% (bait)");
-    ok(projectedRate(20000, null, 0n) === 20000, "first epoch keeps launch rate");
-    ok(projectedRate(20000, 100n, 200n) === 19750, "growth tightens −250bps");
-    ok(projectedRate(20000, 200n, 100n) === 20000, "weakness eases +1000bps (ceiling-capped)");
+    ok(LAUNCH_RATE_BPS === 10000, "mint launch rate = 100% of realized revenue (F-14)");
+    ok(projectedRate(10000, null, 0n) === 10000, "first epoch keeps launch rate");
+    ok(projectedRate(10000, 100n, 200n) === 9750, "growth tightens −250bps");
+    ok(projectedRate(10000, 200n, 100n) === 10000, "weakness eases +1000bps (ceiling-capped at 100%)");
     ok(projectedRate(3100, 1n, 2n) === 3000, "floor 30% pin");
 
     // G4 breaker
@@ -135,7 +135,7 @@ async function interop() {
   const salt = ethers.hexlify(ethers.randomBytes(32));
   const { q, sig } = await Q.signOption({
     classId: 0, dir: 0, premium: U(100), multX1e4: x(3), bandBps: 50,
-    strikeX1e8: K, validUntil: now + 20, salt, buyer: b1.address });
+    strikeX1e8: K, validUntil: now + 20, salt, buyer: b1.address, ttl: 60 });
   const rc = await (await opts.connect(b1).buyOption(q, sig, K, 60)).wait();
   const sold = rc.logs.find((l) => l.fragment?.name === "OSold");
   ok(!!sold, "engine-quoted OQuote passes contract EIP-712 and sells");
@@ -180,10 +180,10 @@ async function interop() {
 
   const now2 = Number((await provider.getBlock("latest")).timestamp);
   const qLose = await Q.signOption({ classId: 0, dir: 0, premium: U(1_000), multX1e4: x(3),
-    bandBps: 50, strikeX1e8: K, validUntil: now2 + 20, salt: ethers.randomBytes(32), buyer: b3.address });
+    bandBps: 50, strikeX1e8: K, validUntil: now2 + 20, salt: ethers.randomBytes(32), buyer: b3.address, ttl: 60 });
   await (await opts.connect(b3).buyOption(qLose.q, qLose.sig, K, 60)).wait(); // id 1
   const qWin = await Q.signOption({ classId: 0, dir: 0, premium: U(100), multX1e4: x(3),
-    bandBps: 50, strikeX1e8: K, validUntil: now2 + 20, salt: ethers.randomBytes(32), buyer: b2.address });
+    bandBps: 50, strikeX1e8: K, validUntil: now2 + 20, salt: ethers.randomBytes(32), buyer: b2.address, ttl: 60 });
   await (await opts.connect(b2).buyOption(qWin.q, qWin.sig, K, 60)).wait();   // id 2
   await provider.send("evm_increaseTime", [75]);
   for (let i = 0; i < 60; i++) { await provider.send("evm_mine", []); }
@@ -200,9 +200,11 @@ async function interop() {
       "Options FeeStreamed splits 0.99% founder / 3.00% stakers");
   ok((await usdc.balanceOf(lp1.address)) - founder0 === founderExpected,
       "Options founder receives exactly 0.99% of gross payout");
+  // F-02 fix: the staker slice is STREAMED over 7 days (accrual is verified in diamond.test.js
+  // [FEE-SPLIT]); at notify time the cash is in the sink and nothing has streamed yet.
   ok((await usdc.balanceOf(feeSinkAddr)) - sink0 === stakerExpected &&
-     (await feeSink.claimable(b3.address)) === stakerExpected,
-      "Options staker slice is pull-based and claimable");
+     (await feeSink.claimable(b3.address)) === 0n,
+      "Options staker slice is pulled into the sink and streams (0 claimable at notify)");
   ok(await opts.lanesIntact(), "Options lanes intact after fee stream");
 
   // --- G8 two-venue: agree signs, disagree refuses (no signature produced)
@@ -231,11 +233,14 @@ async function interop() {
 
   const mm = L.mintAmounts(0, { loyaltySet: new Set([b2.address]), priceX1e8: 1_000_000n });
   const revenue = U(1_000) + U(2_000) + U(1_000) + U(9_000) - (U(500) + U(2_100)); // 10400 edge
-  const expectAnchor = revenue + U(120); // edge + fees 120
-  ok(mm.anchor === expectAnchor, `ledger anchor (fees+edge) = ${mm.anchor}`);
-  { const formula = expectAnchor * 20_000n / 10_000n * 10n ** 20n / 1_000_000n;
-    ok(mm.total <= mm.budget && mm.budget === 2_000_000n * 10n ** 18n && mm.budget < formula,
-      "epoch-0 budget = min(200% × anchor ÷ price, absolute cap) — cap binds here"); }
+  const expectAnchor = revenue; // F-14: realized edge only (fees are already inside stake − payout)
+  ok(mm.anchor === expectAnchor, `ledger anchor (realized edge only) = ${mm.anchor}`);
+  { const formula = expectAnchor * 10_000n / 10_000n * 10n ** 20n / 1_000_000n;
+    ok(mm.total <= mm.budget && mm.budget === formula && formula < 2_000_000n * 10n ** 18n,
+      "epoch-0 budget = 100% × anchor ÷ price (cap not binding at $0.01)");
+    const capped = L.mintAmounts(0, { loyaltySet: new Set([b2.address]), priceX1e8: 500_000n });
+    ok(capped.budget === 2_000_000n * 10n ** 18n && capped.total <= capped.budget,
+      "absolute cap binds when the price is halved"); }
   ok(!mm.amounts.has(b3.address), "net winner gets no mint");
   ok(!mm.amounts.has(owner.address), "zero-fee loss farmer gets no mint");
   const w1 = Math.sqrt(1_000 * 30), w2 = Math.sqrt(1_500 * 60) * 1.25;
@@ -251,7 +256,8 @@ async function interop() {
       "absolute epoch cap bounds every regime");
 
   const mk = buildMerkle(1, mm.amounts);
-  const anchorSig = await signRevenueAnchor(budgeter, 1n, mm.anchor, mm.priceX1e8);
+  const anchorSig = await signRevenueAnchor(budgeter, 1n, mm.anchor, mm.priceX1e8,
+    { chainId: Number((await provider.getNetwork()).chainId), distributor: await dist.getAddress() });
   await (await dist.postEpoch(1, mk.root, mm.total, mm.anchor, mm.priceX1e8, anchorSig)).wait();
   ok(true, "engine merkle root + anchor accepted by DiamondDistributor");
 

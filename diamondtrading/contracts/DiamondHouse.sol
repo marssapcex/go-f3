@@ -14,7 +14,13 @@
 //   - distributions to stakers allowed only with an empty queue and only out of the
 //     slice of pool above TARGET_POOL (launch split 80/20, retained share stays pooled).
 //   - no pause switch anywhere: fully permissoinless settlement path; owner can only
-//     tune menu config (class caps), never gate user funds.
+//     tune menu config (class caps, tighten-only once live), never gate user funds.
+//
+// AUDIT FIXES (see audit/report): F-01 solvency (not equality) lane check + owner sweep of
+// donations; F-08 exact per-notify USDC approvals, revoked on sink rotation, timelocked
+// verifier/quoter swaps; F-09 ttl is signed in the quote; F-10 quotes are single-use;
+// F-11 payouts that the token refuses are credited for pull-withdrawal (no head-of-line DoS);
+// F-12 zero-amount queue entries are never created.
 //
 // Money-lane invariant (checked in tests after every op):
 //   USDC.balanceOf(this) == pool + openStakes                       (cash lanes)
@@ -47,6 +53,7 @@ contract DiamondHouse {
         uint64  validUntil;
         bytes32 salt;
         address buyer;
+        uint64  ttl;          // F-09: buyer's duration is part of the signed quote
     }
     struct Ticket {
         address owner;
@@ -73,7 +80,9 @@ contract DiamondHouse {
     IERC20Min public immutable usdc;
     bytes32 public immutable DOMAIN_SEPARATOR;
     bytes32 public constant QUOTE_TYPEHASH = keccak256(
-        "Quote(uint8 classId,uint8 dir,uint128 stake,uint32 multX1e4,uint64 validUntil,bytes32 salt,address buyer)");
+        "Quote(uint8 classId,uint8 dir,uint128 stake,uint32 multX1e4,uint64 validUntil,bytes32 salt,address buyer,uint64 ttl)");
+    uint256 public constant GOV_DELAY = 2 days;  // F-08: verifier / quoter swaps are timelocked
+    uint256 public constant SEND_GAS_FLOOR = 60_000;  // F-11: minimum gas left for a token payout
     uint256 public constant BPS = 10_000;
     uint256 public constant FEE_BPS = 399;              // ρ = 3.99% of profit, withheld at settle
     uint256 public constant FOUNDER_FEE_BPS = 99;       //   ↳ 0.99% streamed to founderWallet (settable later)
@@ -93,6 +102,16 @@ contract DiamondHouse {
     address public outcomeVerifier;
     address public revenueSink;
     address public founderWallet;  // 0.99% stream destination; UNSET (0x0) ⇒ that slice goes to stakers too
+
+    // F-10: single-use quotes
+    mapping(bytes32 => bool) public quoteUsed;
+    // F-11: payouts refused by the token are credited and pulled later (never stall the queue)
+    mapping(address => uint256) public credits;
+    uint256 public totalCredits;
+    // F-08: timelocked governance for the signing roots
+    struct Pending { address who; uint64 eta; }
+    Pending public pendingQuoter;
+    Pending public pendingVerifier;
 
     uint256 public pool;        // house lane (loses land here directly)
     uint256 public openStakes;  // player lane (unsettled stakes)
@@ -130,6 +149,9 @@ contract DiamondHouse {
     event LpExitRequested(address indexed lp, uint256 shares, uint64 availableAt);
     event LpWithdrawn(address indexed lp, uint256 amount);
     event RevenueDistributed(uint256 amount, address sink);
+    event Credited(address indexed to, uint256 amount);
+    event CreditWithdrawn(address indexed to, uint256 amount);
+    event GovProposed(string what, address who, uint64 eta);
 
     constructor(address _usdc, address _quoter) {
         require(_usdc != address(0) && _quoter != address(0), "zero addr");
@@ -145,9 +167,21 @@ contract DiamondHouse {
     // ---------------- views ----------------
     function balance() public view returns (uint256) { return usdc.balanceOf(address(this)); }
 
-    /// Cash-lane invariant: every wei in the contract belongs to exactly one lane.
+    /// Cash-lane invariant (F-01 fix): the contract must HOLD at least what it owes.
+    /// Surplus (accidental transfers) cannot freeze the protocol; owner may sweep it.
     function lanesIntact() public view returns (bool) {
-        return balance() == pool + openStakes;
+        return balance() >= pool + openStakes + totalCredits;
+    }
+    /// NAV available to LPs: queued winners are senior (F-06).
+    function navPool() public view returns (uint256) {
+        return pool > queueDebt ? pool - queueDebt : 0;
+    }
+    /// Sweep of unallocated surplus only (donations); never touches pool / openStakes / credits.
+    function sweepSurplus(address to) external onlyOwner nonReentrant {
+        uint256 b = balance();
+        uint256 owed = pool + openStakes + totalCredits;
+        require(b > owed, "no surplus");
+        require(usdc.transfer(to, b - owed), "sweep out");
     }
     function liveQueueEntries() public view returns (uint256) {
         return payoutQueue.length - queueHead;
@@ -178,6 +212,7 @@ contract DiamondHouse {
         require(q.validUntil <= block.timestamp + QUOTE_TTL, "quote too far ahead");
         require(q.multX1e4 >= MIN_MULT_X1E4 && q.multX1e4 <= MAX_MULT_X1E4, "mult clamp");
         require(q.multX1e4 >= minMultX1e4, "slippage: mult");
+        require(q.ttl == ttl, "ttl mismatch");                       // F-09
 
         ClassCfg memory cc = classCfg[q.classId];
         require(cc.enabled, "class disabled");
@@ -185,9 +220,11 @@ contract DiamondHouse {
 
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR,
             keccak256(abi.encode(QUOTE_TYPEHASH, q.classId, q.dir, q.stake,
-                                 q.multX1e4, q.validUntil, q.salt, msg.sender))));
+                                 q.multX1e4, q.validUntil, q.salt, msg.sender, q.ttl))));
         require(_recoverSig(digest, sig) == quoterSigner, "bad quote sig");
         require(q.buyer == msg.sender, "quote not yours");
+        require(!quoteUsed[digest], "quote used");                   // F-10
+        quoteUsed[digest] = true;
 
         uint256 stake = q.stake;
         uint256 profit = uint256(q.multX1e4 - 10_000) * stake / 10_000; // (M−1)·S
@@ -252,7 +289,7 @@ contract DiamondHouse {
                 profitQueued = netProfit;
             }
             t.queuedProfit = uint128(profitQueued);
-            require(usdc.transfer(t.owner, S + profitPaid), "pay out");
+            _send(t.owner, S + profitPaid);
         } else if (o == Outcome.KNOCKED) {
             pool += S;                 // papertrade rule: loser money feeds the house pot directly
             stakeBack = 0;
@@ -260,7 +297,7 @@ contract DiamondHouse {
             uint256 rebate = S * REBATE_BPS / BPS;
             stakeBack = rebate;
             pool += S - rebate;
-            require(usdc.transfer(t.owner, rebate), "rebate out");
+            _send(t.owner, rebate);
         }
 
         emit Settled(id, uint8(o), stakeBack, profitPaid, profitQueued, feeTaken);
@@ -275,7 +312,7 @@ contract DiamondHouse {
         require(block.timestamp >= t.expiry + STALL_DELAY, "not stalled");
         t.outcome = Outcome.REFUNDED;
         openStakes -= t.stake;
-        require(usdc.transfer(t.owner, t.stake), "refund out");
+        _send(t.owner, t.stake);
         emit Refunded(id, t.stake);
         require(lanesIntact(), "lane drift");
     }
@@ -295,12 +332,39 @@ contract DiamondHouse {
         uint256 total = founderAmt + stakerAmt;
         if (total == 0 || pool < total) return; // no realized cash: retain in pool, never underflow
         pool -= total;
-        if (founderAmt > 0) require(usdc.transfer(founder, founderAmt), "founder out");
-        if (stakerAmt > 0) IRevenueSink(sink).notifyRevenue(stakerAmt);
+        if (founderAmt > 0) _send(founder, founderAmt);
+        if (stakerAmt > 0) {
+            require(usdc.approve(sink, stakerAmt), "approve");  // F-08: exact, single-use allowance
+            IRevenueSink(sink).notifyRevenue(stakerAmt);
+        }
         emit FeeStreamed(id, founderAmt, stakerAmt);
     }
+    /// F-11: a token-level refusal (blocklist, pause) must not stall the protocol. The amount is
+    /// credited to the payee and can be pulled with withdrawCredit(); the lane stays solvent.
+    function _send(address to, uint256 amount) internal {
+        if (amount == 0) return;
+        // gas floor: a caller must not be able to starve the token call so that it fails and the
+        // payout silently becomes a credit (no theft, but a griefing path). Revert instead.
+        require(gasleft() >= SEND_GAS_FLOOR, "send gas");
+        (bool ok, bytes memory ret) = address(usdc).call(
+            abi.encodeWithSelector(IERC20Min.transfer.selector, to, amount));
+        if (ok && (ret.length == 0 || abi.decode(ret, (bool)))) return;
+        credits[to] += amount;
+        totalCredits += amount;
+        emit Credited(to, amount);
+    }
+    function withdrawCredit() external nonReentrant {
+        uint256 a = credits[msg.sender];
+        require(a > 0, "no credit");
+        credits[msg.sender] = 0;
+        totalCredits -= a;
+        require(usdc.transfer(msg.sender, a), "credit out");
+        emit CreditWithdrawn(msg.sender, a);
+    }
+
     // ---------------- FIFO payout queue ----------------
     function _enqueue(address who, uint256 amount, uint64 ticketId) internal {
+        if (amount == 0) return;                                     // F-12: no zero-value entries
         payoutQueue.push(QueueEntry({ owner: who, amount: uint128(amount), ticketId: ticketId }));
         queueDebt += amount;
         queueOf[ticketId] = payoutQueue.length; // entryId+1 for claimInfo()
@@ -315,7 +379,7 @@ contract DiamondHouse {
             e.amount -= uint128(pay);
             pool -= pay;
             queueDebt -= pay;
-            require(usdc.transfer(e.owner, pay), "queue out");
+            _send(e.owner, pay);                                    // F-11: never revert the queue
             emit Dequeued(queueHead, e.owner, pay);
             if (e.amount == 0) queueHead++;
             n--;
@@ -330,10 +394,15 @@ contract DiamondHouse {
     }
 
     // ---------------- LP vault (optional; pool-backed, first-loss) ----------------
+    // F-04/F-05: virtual shares & assets (ERC-4626 inflation defence). The offset makes a 1-wei
+    // deposit into an orphaned pool worth ~0 shares and makes donation-based share inflation
+    // unprofitable. Virtual shares are never redeemable, so the dust stays in the pool.
+    uint256 public constant VIRTUAL_SHARES = 1e6;
+    uint256 public constant VIRTUAL_ASSETS = 1;
+
     function lpDeposit(uint256 amount) external nonReentrant returns (uint256 shares) {
         require(amount > 0, "zero");
-        if (totalShares == 0 || pool == 0) shares = amount;
-        else shares = amount * totalShares / pool;
+        shares = amount * (totalShares + VIRTUAL_SHARES) / (navPool() + VIRTUAL_ASSETS);
         require(shares > 0, "dust");
         require(usdc.transferFrom(msg.sender, address(this), amount), "pay in");
         pool += amount;
@@ -356,11 +425,15 @@ contract DiamondHouse {
         require(sh > 0, "nothing");
         require(block.timestamp >= lpExitAvailableAt[msg.sender], "locked");
         lpPendingExit[msg.sender] = 0;
+        // NAV slice computed BEFORE burning (F-06: senior queue debt is excluded)
+        uint256 amount = sh * (navPool() + VIRTUAL_ASSETS) / (totalShares + VIRTUAL_SHARES);
+        if (amount > navPool()) amount = navPool();
+        // never burn shares for nothing: while queued winners owe more than the pool, NAV is 0
+        // and the exit must wait (reverts → shares and the exit request are kept).
+        require(amount > 0, "nav empty");
         totalShares -= sh;
-        uint256 amount = pool == 0 ? 0 : sh * pool / (totalShares + sh); // NAV slice
-        if (amount > pool) amount = pool;
         pool -= amount;
-        require(usdc.transfer(msg.sender, amount), "lp out");
+        _send(msg.sender, amount);
         emit LpWithdrawn(msg.sender, amount);
         require(lanesIntact(), "lane drift");
     }
@@ -377,7 +450,8 @@ contract DiamondHouse {
         require(revenueSink != address(0), "no sink");
         require(amount > 0 && amount <= distributable(), "nothing/too much");
         pool -= amount;                                   // pre-debit against reentrancy/double-count
-        IRevenueSink(revenueSink).notifyRevenue(amount);  // sink pulls via transferFrom (approved)
+        require(usdc.approve(revenueSink, amount), "approve");  // F-08: exact allowance
+        IRevenueSink(revenueSink).notifyRevenue(amount);  // sink pulls exactly `amount`
         emit RevenueDistributed(amount, revenueSink);
         require(lanesIntact(), "lane drift");
     }
@@ -385,15 +459,47 @@ contract DiamondHouse {
     // ---------------- governance (tighten-only where it matters) ----------------
     function setClassCfg(uint8 classId, uint32 maxMult2, uint64 profitCap, bool enabled) external onlyOwner {
         require(maxMult2 >= MIN_MULT_X1E4 && maxMult2 <= MAX_MULT_X1E4, "class mult range");
+        ClassCfg memory old = classCfg[classId];
+        if (old.enabled) {                                          // live class: tighten-only
+            require(maxMult2 <= old.maxMultX1e4 && profitCap <= old.profitCap, "tighten only");
+        }
         classCfg[classId] = ClassCfg(maxMult2, profitCap, enabled);
         emit ClassSet(classId, maxMult2, profitCap, enabled);
     }
     function setTargetPool(uint256 tp) external onlyOwner { targetPool = tp; emit ParamSet("targetPool", tp); }
-    function setQuoter(address qa) external onlyOwner { require(qa != address(0), "zero"); quoterSigner = qa; emit ParamSet("quoter", uint256(uint160(qa))); }
-    function setOutcomeVerifier(address v) external onlyOwner { require(v != address(0), "zero"); outcomeVerifier = v; emit ParamSet("verifier", uint256(uint160(v))); }
+    // F-08: the signing roots can only be swapped through a public 2-day timelock once set.
+    // Initial wiring (zero → value) stays immediate so deployment scripts keep working.
+    function proposeQuoter(address qa) external onlyOwner {
+        require(qa != address(0), "zero");
+        pendingQuoter = Pending(qa, uint64(block.timestamp + GOV_DELAY));
+        emit GovProposed("quoter", qa, pendingQuoter.eta);
+    }
+    function executeQuoter() external {
+        Pending memory p = pendingQuoter;
+        require(p.who != address(0) && block.timestamp >= p.eta, "not ready");
+        quoterSigner = p.who; delete pendingQuoter;
+        emit ParamSet("quoter", uint256(uint160(p.who)));
+    }
+    function proposeOutcomeVerifier(address v) external onlyOwner {
+        require(v != address(0), "zero");
+        pendingVerifier = Pending(v, uint64(block.timestamp + GOV_DELAY));
+        emit GovProposed("verifier", v, pendingVerifier.eta);
+    }
+    function executeOutcomeVerifier() external {
+        Pending memory p = pendingVerifier;
+        require(p.who != address(0) && block.timestamp >= p.eta, "not ready");
+        outcomeVerifier = p.who; delete pendingVerifier;
+        emit ParamSet("verifier", uint256(uint160(p.who)));
+    }
+    function setOutcomeVerifier(address v) external onlyOwner {
+        require(v != address(0) && outcomeVerifier == address(0), "timelocked: use proposeOutcomeVerifier");
+        outcomeVerifier = v; emit ParamSet("verifier", uint256(uint160(v)));
+    }
+    /// Rotating the sink revokes the previous sink's allowance (no stale spender).
     function setRevenueSink(address s) external onlyOwner {
-        revenueSink = s;
-        require(usdc.approve(s, type(uint256).max), "approve");
+        require(s.code.length > 0, "sink must be a contract");   // F-08: an EOA sink would brick settlements
+        if (revenueSink != address(0)) usdc.approve(revenueSink, 0);
+        revenueSink = s;                       // no standing approval: see _streamFee / distributeRevenue
         emit ParamSet("revenueSink", uint256(uint160(s)));
     }
     function setFounderWallet(address f) external onlyOwner { founderWallet = f; emit ParamSet("founderWallet", uint256(uint160(f))); }

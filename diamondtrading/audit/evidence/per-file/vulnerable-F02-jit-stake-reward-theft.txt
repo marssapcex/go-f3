@@ -1,0 +1,13 @@
+
+
+  F-02 JIT stake reward theft [set=vulnerable]
+  [EVIDENCE] fee streamed to stakers (rewardIndex delta) ≈ 399 USDC
+  [EVIDENCE] attacker (90k DIAMOND, staked 0s) claimable=359100000 paid=359100000 (base units, 6dp)
+  [EVIDENCE] honest (10k DIAMOND, staked since genesis) earned=39900000 (base units, 6dp) after the 7d stream
+  [EVIDENCE] attacker share of the single fee event = 90.00%
+    ✔ attacker staking 9x the honest stake right before a fee event takes ~90% of the fee (877ms)
+
+
+  1 passing (880ms)
+
+EXIT=0

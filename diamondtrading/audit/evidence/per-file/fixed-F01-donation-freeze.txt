@@ -1,0 +1,18 @@
+
+
+  F-01 donation freeze [set=fixed]
+  [EVIDENCE] attacker p5 sent 1 wei USDC to House. lanesIntact()=true
+  [EVIDENCE] buyTicket by honest p2            → OK
+  [EVIDENCE] settleWithProof(id, KNOCKED)      → OK
+  [EVIDENCE] harvest(1)                        → OK
+  [EVIDENCE] lpWithdraw() after 7d lock        → OK
+  [EVIDENCE] refundAfterStall(unsettled id) after stall → OK
+  [EVIDENCE] fixed: surplus (donation) in House = 1 wei; owed = 10000001
+    ✔ House: 1-wei donation freezes buy / settle / harvest / refund / LP exit (916ms)
+  [EVIDENCE] Options.buyOption after donation  → OK
+    ✔ Options: 1-wei donation blocks new option sales and settlement (145ms)
+
+
+  2 passing (1s)
+
+EXIT=0

@@ -1,0 +1,28 @@
+
+
+  F-06 LP exit subordinates the queue [set=fixed]
+  [EVIDENCE] queueDebt after 5 wins with empty pool = 480050000 (6dp), pool = 0
+  [EVIDENCE] after LP deposit 100: pool=100000000, queueDebt=480050000
+  [EVIDENCE] lpWithdraw → nav empty, LP received 0 USDC
+  [EVIDENCE] remaining queueDebt owed to winners = 480050000 (6dp), pool = 100000000
+    ✔ LP withdraws its 100 USDC while winners' profit is still owed (913ms)
+
+  F-07 public deployment keys [set=fixed]
+    - PoC (vulnerable): anyone holding the public mnemonic can quote a 50x ticket and attest it WON
+  [EVIDENCE] deploy.js (no keys, no DEMO_KEYS) → exit 2: deploy refused: no signing keys (missing env: QUOTER_KEY, ATTESTER_KEY_1, ATTESTER_KEY_2, ATTESTER_KEY_3, BUDGETER_KEY); set them or use DEMO_KEYS=1 on a local chain
+    ✔ fixed: deploy.js refuses to run without explicit keys (exit 2, no demo fallback) (105ms)
+  [EVIDENCE] deploy.js (DEMO_KEYS=1, chainId 1) → exit 2: deploy refused: DEMO_KEYS=1 is only allowed on local chains (got chainId 1)
+    ✔ fixed: DEMO_KEYS=1 is refused on a non-local chain (public mnemonic never signs on a real network) (125ms)
+
+  F-08 owner-controlled drain via approvals [set=fixed]
+  [EVIDENCE] House holds 102000 USDC (pool 100,000 + open player stake 2,000)
+  [EVIDENCE] owner.setRevenueSink(EOA) → sink must be a contract
+  [EVIDENCE] EOA.transferFrom(House → EOA, all) → allowance; EOA gained 0 USDC
+  [EVIDENCE] fixed: allowance House→previous sink after rotation = 0
+    ✔ owner points revenueSink at an EOA: the EOA drains House, including open player stakes (222ms)
+
+
+  4 passing (1s)
+  1 pending
+
+EXIT=0

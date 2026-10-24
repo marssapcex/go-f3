@@ -2,17 +2,24 @@
   "name": "diamondtrading",
   "version": "0.2.0",
   "private": true,
-  "description": "DiamondTrading v2 — queue-bounded turbo markets (pool-zero playable), anti-farm smart mint",
+  "description": "DiamondTrading v2 \u2014 queue-bounded turbo markets (pool-zero playable), anti-farm smart mint",
   "scripts": {
     "compile": "node compile.js",
     "test": "node compile.js && node test/diamond.test.js && node test/engine.test.js && SEED=1337 node test/fuzz.js",
     "test:unit": "node test/diamond.test.js",
     "test:engine": "node test/engine.test.js",
-    "test:fuzz": "node test/fuzz.js"
+    "test:fuzz": "node test/fuzz.js",
+    "audit:build": "node audit/lib/build.js",
+    "audit:poc": "node audit/lib/build.js && AUDIT_SET=vulnerable npx hardhat --config audit/hardhat.config.js test audit/test/*.test.js",
+    "audit:regress": "node audit/lib/build.js && AUDIT_SET=fixed npx hardhat --config audit/hardhat.config.js test audit/test/*.test.js"
   },
   "dependencies": {
     "ethers": "^6.17.0",
     "ganache": "^7.9.2",
     "solc": "0.8.26"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-ethers": "^3.1.3",
+    "hardhat": "^2.29.1"
   }
 }

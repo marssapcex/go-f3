@@ -1,0 +1,18 @@
+
+
+  F-01 donation freeze [set=vulnerable]
+  [EVIDENCE] attacker p5 sent 1 wei USDC to House. lanesIntact()=false
+  [EVIDENCE] buyTicket by honest p2            → lane drift
+  [EVIDENCE] settleWithProof(id, KNOCKED)      → lane drift
+  [EVIDENCE] harvest(1)                        → lane drift
+  [EVIDENCE] lpWithdraw() after 7d lock        → lane drift
+  [EVIDENCE] refundAfterStall(unsettled id) after stall → lane drift
+  [EVIDENCE] stuck USDC in House = 100150000001 (6dp) — no sweep function exists
+    ✔ House: 1-wei donation freezes buy / settle / harvest / refund / LP exit (886ms)
+  [EVIDENCE] Options.buyOption after donation  → lane drift
+    ✔ Options: 1-wei donation blocks new option sales and settlement (144ms)
+
+
+  2 passing (1s)
+
+EXIT=0
