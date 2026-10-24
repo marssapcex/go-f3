@@ -1,5 +1,5 @@
 {
-  "_comment": "V2 underlyer menu for DiamondHouse.classCfg. classId is the single source of truth shared by quoter (off-chain pricing), the attester set (settlement reference), and the on-chain class table. V2 has NO solvency gate: static lines are (a) per-ticket profit cap profitCap = max (M-1)*S in USDC(6dp), (b) queueDebt < QMAX. DYNAMIC G3 caps (ALGORITHM): P_max = min(k*lambda*omega, profitCap) measured live from routed-venue flow supersede the static cap whenever TIGHTER. Governance can only tighten caps after deploy.",
+  "_comment": "V3 underlyer menu and the single classId/cap source for deployment, quoting, and settlement. There is no solvency gate, QMAX, or pause. The static per-ticket profitCap bounds max (M-1)*S in USDC(6dp); dynamic G3 caps measured from routed-venue flow must tighten it off-chain before signing.",
   "_units": {
     "maxMultX1e4": "multiplier * 1e4 (1000x = 10000000)",
     "profitCap": "max profit (M-1)*S per ticket, USDC 6dp"

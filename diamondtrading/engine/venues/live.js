@@ -1,10 +1,37 @@
 // Live venue adapters (Binance / Hyperliquid) — endpoint-complete, NOT live-tested
 // in this sandbox (both geo-blocked from here — see research/LIQUIDITY.md).
 // Runtime hosts without those blocks use these directly; venue set is pluggable.
-// Bybit was evaluated and dropped from the launch router (see LIQUIDITY.md).
+// Bybit was evaluated and dropped from the launch router (see research/LIQUIDITY.md).
 import { TradeTape } from "./base.js";
 
 const j = (r) => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); };
+
+// Bounded insertion-ordered dedupe. Venue IDs, never timestamps, identify a print:
+// multiple real trades may share one millisecond.
+function dedupe(limit = 10_000) {
+  const seen = new Set();
+  return (key) => {
+    if (seen.has(key)) return false;
+    seen.add(key);
+    if (seen.size > limit) seen.delete(seen.values().next().value);
+    return true;
+  };
+}
+
+// setInterval must not overlap slow HTTP responses. One in-flight request per tape
+// keeps cursors monotonic and prevents duplicate snapshots being appended.
+function poll(tape, tick, pollMs) {
+  let running = false, stopped = false;
+  const run = async () => {
+    if (running || stopped) return;
+    running = true;
+    try { await tick(); } catch (_) { /* retry next tick */ }
+    finally { running = false; }
+  };
+  const h = setInterval(run, pollMs);
+  run();
+  tape.stop = () => { stopped = true; clearInterval(h); };
+}
 
 export class BinanceVenue {
   constructor({ futures = true } = {}) {
@@ -21,17 +48,21 @@ export class BinanceVenue {
              asks: d.asks.map(([p, q]) => [Number(p), Number(q)]) };
   }
   startTape(asset, { pollMs = 900 } = {}) {
-    const tape = new TradeTape();
+    const tape = new TradeTape(), remember = dedupe();
     let fromId;
     const tick = async () => {
-      try {
-        const q = fromId ? `&fromId=${fromId + 1}` : "&limit=1000";
-        const rows = await fetch(
-          `${this.rest}/aggTrades?symbol=${asset}USDT${q}`).then(j);
-        for (const t of rows) { tape.add(Number(t.T), Number(t.p), Number(t.q)); fromId = t.a; }
-      } catch (_) { /* retry next tick */ }
+      const q = fromId === undefined ? "&limit=1000" : `&fromId=${fromId + 1n}`;
+      const rows = await fetch(`${this.rest}/aggTrades?symbol=${asset}USDT${q}`).then(j);
+      for (const t of rows) {
+        let id;
+        try { id = BigInt(t.a); } catch (_) { continue; } // skip malformed IDs, keep draining later rows
+        if (fromId !== undefined && id <= fromId) continue;
+        if (!remember(id.toString())) continue;
+        fromId = id; // advance even for a malformed print so it cannot poison later polls
+        tape.add(Number(t.T), Number(t.p), Number(t.q));
+      }
     };
-    const h = setInterval(tick, pollMs); tick(); tape.stop = () => clearInterval(h);
+    poll(tape, tick, pollMs);
     return tape;
   }
 }
@@ -54,17 +85,17 @@ export class HyperliquidVenue {
              asks: d.levels[1].map((l) => [Number(l.px), Number(l.sz)]) };
   }
   startTape(asset, { pollMs = 900 } = {}) {
-    const tape = new TradeTape();
-    let lastT = 0;
+    const tape = new TradeTape(), remember = dedupe();
     const tick = async () => {
-      try {
-        const rows = await this._post({ type: "recentTrades", coin: asset });
-        for (const t of rows.slice().reverse()) {
-          if (t.time > lastT) { tape.add(t.time, Number(t.px), Number(t.sz)); lastT = t.time; }
-        }
-      } catch (_) {}
+      const rows = await this._post({ type: "recentTrades", coin: asset });
+      for (const t of rows.slice().reverse()) {
+        // Hyperliquid supplies tid. The full-row fallback keeps deterministic mocks and
+        // older payloads distinct without discarding same-millisecond trades.
+        const key = t.tid !== undefined ? `tid:${t.tid}` : `row:${JSON.stringify(t)}`;
+        if (remember(key)) tape.add(Number(t.time), Number(t.px), Number(t.sz));
+      }
     };
-    const h = setInterval(tick, pollMs); tick(); tape.stop = () => clearInterval(h);
+    poll(tape, tick, pollMs);
     return tape;
   }
 }

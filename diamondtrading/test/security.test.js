@@ -409,6 +409,59 @@ async function main() {
     } finally { server.close(); }
   }
 
+  console.log("\n[SEC-08] zero attesters rejected and failed sinks cannot block settlement");
+  {
+    const W = await makeWorld({ withOptions: true, blocklist: true });
+    await expectRevert(W.ov.connect(owner).setAttester(ethers.ZeroAddress, true), "zero",
+      "outcome verifier rejects zero-address attester");
+    await expectRevert(W.pv.connect(owner).setAttester(ethers.ZeroAddress, true), "zero",
+      "price verifier rejects zero-address attester");
+
+    await (await W.diamond.setMinter(owner.address)).wait();
+    await (await W.diamond.mint(honest.address, E18(1_000))).wait();
+    await (await W.diamond.connect(honest).approve(W.sA, ethers.MaxUint256)).wait();
+    await (await W.sink.connect(honest).stake(E18(1_000), { gasLimit: 500_000 })).wait();
+    await (await W.house.connect(lp).lpDeposit(U(1_000))).wait();
+    const seedOption = await W.buyOption(p3, U(1_000), 3, 60);
+    await warp(75);
+    await W.settleOption(seedOption, PX(78)); // zero payout: seed 1,000 USDC of Options pool
+
+    const houseId = await W.buyHouse(p1, U(100), 2);
+    const optionId = await W.buyOption(p1, U(100), 3, 60);
+    await (await W.usdc.connect(owner).setBlocked(W.sA, true)).wait();
+    await W.settleHouse(houseId, 1);
+    const ht = await W.house.tickets(houseId);
+    const houseGross = (ht.multX1e4 - 10_000n) * ht.stake / 10_000n;
+    const houseFee = houseGross * 399n / 10_000n;
+    ok(ht.outcome === 1n && await W.house.pool() === U(1_000) - (houseGross - houseFee) &&
+       await W.usdc.balanceOf(W.sA) === 0n && await W.house.lanesIntact(),
+      "blocked House sink retains only its fee slice and settlement succeeds");
+
+    await warp(75);
+    await W.settleOption(optionId, PX(79));
+    const ot = await W.options.options(optionId);
+    const optionPayout = ot.maxPay; // close is beyond the 0.5% band
+    const optionFee = optionPayout * 399n / 10_000n;
+    ok(ot.state === 1n && await W.options.pool() === U(1_100) - (optionPayout - optionFee) &&
+       await W.usdc.balanceOf(W.sA) === 0n && await W.options.lanesIntact(),
+      "blocked Options sink retains only its fee slice and settlement succeeds");
+    ok(await W.usdc.allowance(W.hA, W.sA) === 0n && await W.usdc.allowance(W.oA, W.sA) === 0n,
+      "failed sink notifications leave zero standing allowance");
+
+    const N = await makeWorld();
+    const nonPull = await (await C("NonPullSink", owner).deploy()).waitForDeployment();
+    const npA = await nonPull.getAddress();
+    await (await N.house.setRevenueSink(npA)).wait();
+    await (await N.house.connect(lp).lpDeposit(U(1_000))).wait();
+    const nonPullId = await N.buyHouse(p1, U(100), 2);
+    await N.settleHouse(nonPullId, 1);
+    const nt = await N.house.tickets(nonPullId), ng = (nt.multX1e4 - 10_000n) * nt.stake / 10_000n;
+    const nf = ng * 399n / 10_000n;
+    ok(nt.outcome === 1n && await N.house.pool() === U(1_000) - (ng - nf) &&
+       await N.usdc.allowance(N.hA, npA) === 0n && await N.house.lanesIntact(),
+      "successful-but-non-pulling sink also retains its fee without blocking settlement");
+  }
+
   console.log(`\n==== security regression: ${pass} passed, ${fail} failed ====`);
   process.exit(fail === 0 ? 0 : 1);
 }

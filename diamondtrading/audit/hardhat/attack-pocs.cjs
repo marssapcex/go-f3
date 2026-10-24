@@ -77,13 +77,10 @@ async function rollingTinyNotification() {
 }
 
 async function zeroAddressAttester() {
-  console.log("\n[POC-03] zero-address attester configuration");
+  console.log("\n[POC-03] zero-address attester configuration is rejected");
   const W = await makeWorld({ withOptions: false, seedDiamond: false });
-  await (await W.ov.connect(W.owner).setAttester(ethers.ZeroAddress, true)).wait();
-  const sigs = await W.signOutcome(0n, 1);
-  const invalid = "0x" + "00".repeat(64) + "1b"; // 65 bytes; ecrecover returns address(0)
-  const accepted = await W.ov.verify(0n, 1, [invalid, sigs[0]]);
-  ok(accepted, "one real signature + one invalid zero-recovering signature met threshold 2 after owner enabled address(0)");
+  await mustReject(W.ov.connect(W.owner).setAttester(ethers.ZeroAddress, true), "zero");
+  ok(!(await W.ov.isAttester(ethers.ZeroAddress)), "owner cannot enable a zero-recovering attester");
 }
 
 async function earlyOutcomeSettlement() {
@@ -101,15 +98,15 @@ async function hyperliquidSameTimestamp() {
   console.log("\n[POC-05] Hyperliquid recentTrades with identical millisecond timestamps");
   const venue = new HyperliquidVenue();
   venue._post = async () => [
-    { time: 1_000, px: "101", sz: "2" },
-    { time: 1_000, px: "100", sz: "3" },
+    { tid: 2, time: 1_000, px: "101", sz: "2" },
+    { tid: 1, time: 1_000, px: "100", sz: "3" },
   ];
   const tape = venue.startTape("HYPE", { pollMs: 1_000_000 });
   await new Promise((resolve) => setTimeout(resolve, 20));
   tape.stop();
   console.log(`  FACT retained trades=${tape.trades.length}, payload=${JSON.stringify(tape.trades)}`);
-  ok(tape.trades.length === 1 && tape.trades[0].qty === 3,
-    "lastT strictly greater-than filtering dropped the second same-millisecond trade");
+  ok(tape.trades.length === 2 && tape.vwap(1_000, 1_000).qty === 5,
+    "ID-based dedupe retains both distinct same-millisecond trades");
 }
 
 async function binanceOverlappingPolls() {
@@ -128,8 +125,8 @@ async function binanceOverlappingPolls() {
   await new Promise((resolve) => setTimeout(resolve, 40));
   global.fetch = originalFetch;
   console.log(`  FACT identical trade responses=${initialCalls}, retained prints=${tape.trades.length}, VWAP quantity=${tape.vwap(1_000, 1_000).qty}`);
-  ok(initialCalls >= 2 && tape.trades.length === initialCalls, "every overlapping response appended the same aggTrade ID");
-  ok(tape.vwap(1_000, 1_000).qty === 2 * initialCalls, "duplicate prints inflate measured quantity linearly");
+  ok(initialCalls === 1 && tape.trades.length === 1, "single-flight prevents overlapping initial snapshots");
+  ok(tape.vwap(1_000, 1_000).qty === 2, "aggTrade ID dedupe preserves the real quantity");
 }
 
 async function blockedRevenueSink() {
@@ -139,11 +136,13 @@ async function blockedRevenueSink() {
   await (await W.house.connect(W.lp).lpDeposit(U(1_000))).wait();
   await (await W.usdc.connect(W.owner).setBlocked(W.sA, true)).wait();
   const id = await W.buyHouse(W.p1, U(100), 2);
-  await mustReject(W.settleHouse(id, 1), "blocked");
-  ok((await W.house.tickets(id)).outcome === 0n, "a blocked sink reverts the whole WON settlement instead of crediting the fee");
-  await (await W.house.connect(W.owner).setRevenueSink(ethers.ZeroAddress)).wait();
   await W.settleHouse(id, 1);
-  ok((await W.house.tickets(id)).outcome === 1n, "the test token allows owner recovery by disabling the sink");
+  const t = await W.house.tickets(id), gross = (t.multX1e4 - 10_000n) * t.stake / 10_000n;
+  const fee = gross * 399n / 10_000n;
+  ok(t.outcome === 1n && await W.house.pool() === U(1_000) - (gross - fee) && await W.usdc.balanceOf(W.sA) === 0n,
+    "a blocked sink retains its fee in pool without reverting WON settlement");
+  ok(await W.usdc.allowance(W.hA, W.sA) === 0n && await W.house.lanesIntact(),
+    "failed sink notification leaves no allowance and preserves token lanes");
 }
 
 async function zeroNavRecapitalization() {
@@ -199,7 +198,7 @@ async function malformedTapeAndWeightPrecision() {
   const tape = new TradeTape();
   tape.add(1_000, 100, 0);
   const v = tape.vwap(1_000, 1_000);
-  ok(v && Number.isNaN(v.px), "a zero-quantity print produces NaN VWAP instead of NO-PRINT");
+  ok(v === null && tape.trades.length === 0, "a zero-quantity print is rejected as NO-PRINT");
 
   let maxAbs = 0n, maxRel = 0, maxCase = null;
   for (const scale of [1, 1_000, 1_000_000, 1_000_000_000]) {

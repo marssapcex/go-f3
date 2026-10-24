@@ -9,6 +9,7 @@ const path = require("path");
 
 const { TradeTape, depthWithinBand } = require("../engine/venues/base.js");
 const { MockVenue } = require("../engine/venues/mock.js");
+const { BinanceVenue, HyperliquidVenue } = require("../engine/venues/live.js");
 const { routeAsset, payoutCeiling, SpikeBreaker } = require("../engine/caps.js");
 const { bustProb, offerMultiplier, clampMultiplier } = require("../engine/pricer.js");
 const { Quoter, Attester, agreePrice } = require("../engine/quoter.js");
@@ -76,6 +77,44 @@ async function algos() {
     tape.add(10_400, 99, 1);                               // late arrival: must be dropped
     const v2 = tape.vwap(11_000, 2_000);
     ok(Math.abs(v2.px - (10 + 30 * 3 + 88) / 5) < 1e-12, "out-of-order trade dropped");
+  }
+
+  console.log("\n[EB2] live adapter integrity and malformed-print rejection");
+  {
+    const invalid = new TradeTape();
+    invalid.add(1_000, 100, 0);
+    invalid.add(1_001, Number.NaN, 1);
+    ok(invalid.trades.length === 0 && invalid.vwap(1_001, 1_000) === null,
+      "zero-quantity and non-finite prints become NO-PRINT");
+
+    const hl = new HyperliquidVenue();
+    hl._post = async () => [
+      { tid: 2, time: 1_000, px: "101", sz: "2" },
+      { tid: 1, time: 1_000, px: "100", sz: "3" },
+    ];
+    const ht = hl.startTape("HYPE", { pollMs: 1_000_000 });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    ht.stop();
+    ok(ht.trades.length === 2 && ht.vwap(1_000, 1_000).qty === 5,
+      "Hyperliquid keeps distinct trades sharing a millisecond");
+
+    const bn = new BinanceVenue(), originalFetch = global.fetch;
+    let initialCalls = 0, bt;
+    global.fetch = async (url) => {
+      if (String(url).includes("fromId=")) return { ok: true, json: async () => [] };
+      initialCalls++;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      return { ok: true, json: async () => [
+        { T: 1_000, p: "100", q: "2", a: "not-an-id" },
+        { T: 1_000, p: "100", q: "2", a: 7 },
+      ] };
+    };
+    try {
+      bt = bn.startTape("BTC", { pollMs: 5 });
+      await new Promise((resolve) => setTimeout(resolve, 70));
+    } finally { if (bt) bt.stop(); global.fetch = originalFetch; }
+    ok(initialCalls === 1 && bt.trades.length === 1 && bt.vwap(1_000, 1_000).qty === 2,
+      "Binance single-flight and ID dedupe prevent overlapping duplicate prints");
   }
 
   console.log("\n[EC] pricer");

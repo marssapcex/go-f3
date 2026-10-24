@@ -85,14 +85,23 @@ const E18 = (n) => BigInt(n) * 10n ** 18n;
   await (await sink.connect(owner).stake(E18(10_000))).wait();
   // founderWallet deliberately remains address(0) on both engines; owner sets it later.
 
-  // menu: 1 BTC 1000x, 2 ETH 1000x, 3 SOL 500x, 4 HYPE 500x, 5 BNB 200x, 6 SP500 100x, 7 XYZ100 100x
-  const menu = [
-    [1, 10_000_000, U(250_000)], [2, 10_000_000, U(250_000)], [3, 5_000_000, U(100_000)],
-    [4, 5_000_000, U(50_000)],   [5, 2_000_000, U(50_000)],   [6, 1_000_000, U(25_000)], [7, 1_000_000, U(25_000)],
-  ];
-  for (const [cid, mult, cap] of menu) {
+  // The checked-in menu is the only class-ID/cap source. Never maintain a second mapping here.
+  const menu = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "config", "menu.json"), "utf8")).classes;
+  const seenClasses = new Set();
+  for (const c of menu) {
+    const cid = c.classId, mult = c.maxMultX1e4, cap = BigInt(c.profitCap);
+    if (!Number.isInteger(cid) || cid < 0 || cid > 255 || seenClasses.has(cid) ||
+        !Number.isInteger(mult) || mult < 10_500 || mult > 10_000_000) {
+      throw new Error(`invalid or duplicate menu class ${cid}`);
+    }
+    seenClasses.add(cid);
     await (await house.setClassCfg(cid, mult, cap, true)).wait();
     await (await options.connect(owner).setClassCfg(cid, Math.min(mult, 250_000), cap, true)).wait();
+    const hc = await house.classCfg(cid), oc = await options.classCfg(cid);
+    if (!hc.enabled || hc.maxMultX1e4 !== BigInt(mult) || hc.profitCap !== cap ||
+        !oc.enabled || oc.maxMultX1e4 !== BigInt(Math.min(mult, 250_000)) || oc.payCap !== cap) {
+      throw new Error(`deployed class ${cid} does not match config/menu.json`);
+    }
   }
 
   // seed: fund 10 demo accounts with USDC + approvals, seed LP 100k so pool is playable

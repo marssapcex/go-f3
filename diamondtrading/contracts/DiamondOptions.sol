@@ -254,13 +254,30 @@ contract DiamondOptions {
         if (total == 0 || pool < total) return; // no realized cash: retain in pool, never underflow
         pool -= total;
         if (founderAmt > 0) _send(founder, founderAmt);
+        uint256 streamedToStakers = 0;
         if (stakerAmt > 0) {
             require(usdc.approve(sink, 0), "approve reset");
             require(usdc.approve(sink, stakerAmt), "approve");
-            IRevenueSinkO(sink).notifyRevenue(stakerAmt); // pulls exactly stakerAmt
-            require(usdc.allowance(address(this), sink) == 0, "allowance left");
+            uint256 beforeNotify = usdc.balanceOf(address(this));
+            try IRevenueSinkO(sink).notifyRevenue(stakerAmt) {
+                uint256 afterNotify = usdc.balanceOf(address(this));
+                require(afterNotify <= beforeNotify, "sink balance");
+                uint256 pulled = beforeNotify - afterNotify;
+                require(pulled <= stakerAmt, "sink overpull");
+                uint256 notPulled = stakerAmt - pulled;
+                if (notPulled > 0) pool += notPulled; // a no-op/non-pulling sink cannot block settlement
+                streamedToStakers = pulled;
+                require(usdc.approve(sink, 0), "approve reset");
+                require(usdc.allowance(address(this), sink) == 0, "allowance left");
+            } catch {
+                // A blocked/reverting sink must not hold player settlement hostage.
+                // Its token transfer reverted atomically; retain this slice in pool.
+                pool += stakerAmt;
+                require(usdc.approve(sink, 0), "approve reset");
+                require(usdc.allowance(address(this), sink) == 0, "allowance left");
+            }
         }
-        emit FeeStreamed(id, founderAmt, stakerAmt);
+        emit FeeStreamed(id, founderAmt, streamedToStakers);
     }
     /// Attester stall > 24h past expiry ⇒ premium back verbatim.
     function refundAfterStall(uint256 id) external nonReentrant {

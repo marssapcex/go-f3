@@ -46,6 +46,7 @@ contract MultiPriceVerifier is IPriceVerifier {
     }
 
     function setAttester(address who, bool on) external onlyOwner {
+        require(who != address(0), "zero");
         isAttester[who] = on;
         if (on) attesterList.push(who);
         emit AttesterSet(who, on);
@@ -139,6 +140,7 @@ contract MultiAttesterVerifier is IOutcomeVerifier {
     }
 
     function setAttester(address who, bool on) external onlyOwner {
+        require(who != address(0), "zero");
         isAttester[who] = on;
         if (on) attesterList.push(who);
         emit AttesterSet(who, on);

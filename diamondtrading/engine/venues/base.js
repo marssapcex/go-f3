@@ -14,11 +14,14 @@ export class TradeTape {
     this.trades = [];           // { t: ms, px, qty } ascending by t
   }
   add(t, px, qty) {
+    if (!Number.isFinite(t) || t < 0 || !Number.isFinite(px) || px <= 0 ||
+        !Number.isFinite(qty) || qty <= 0) return false;
     const last = this.trades[this.trades.length - 1];
-    if (last && t < last.t) return;          // drop out-of-order (exchange replays)
+    if (last && t < last.t) return false;     // drop out-of-order (exchange replays)
     this.trades.push({ t, px, qty });
     const cut = t - this.windowMs;
     while (this.trades.length && this.trades[0].t < cut) this.trades.shift();
+    return true;
   }
   /** G2 persistence TWAP: volume-weighted mean fill price over [tEnd-window, tEnd]. */
   vwap(tEnd, windowMs) {
@@ -27,7 +30,8 @@ export class TradeTape {
     for (const tr of this.trades) {
       if (tr.t >= t0 && tr.t <= tEnd) { pq += tr.px * tr.qty; q += tr.qty; n++; }
     }
-    return n ? { px: pq / q, qty: q, n } : null;   // null = NO-PRINT (G8 honest failure)
+    const px = pq / q;
+    return n && q > 0 && Number.isFinite(px) && Number.isFinite(q) ? { px, qty: q, n } : null; // honest NO-PRINT
   }
   /** realized per-second σ from trade-to-trade log returns in [tEnd-window, tEnd] */
   sigma(tEnd, windowMs = 30_000) {
@@ -35,12 +39,13 @@ export class TradeTape {
     const p = this.trades.filter((tr) => tr.t >= t0 && tr.t <= tEnd).map((tr) => tr.px);
     if (p.length < 6) return null;
     const rs = [];
-    for (let i = 1; i < p.length; i++) if (p[i - 1] > 0) rs.push(Math.log(p[i] / p[i - 1]));
+    for (let i = 1; i < p.length; i++) if (p[i - 1] > 0 && p[i] > 0) rs.push(Math.log(p[i] / p[i - 1]));
     if (rs.length < 5) return null;
     const m = rs.reduce((a, b) => a + b, 0) / rs.length;
     const v = rs.reduce((a, b) => a + (b - m) ** 2, 0) / (rs.length - 1);
     const dt = windowMs / 1000 / rs.length;
-    return Math.sqrt(v / dt);                // σ per second
+    const sigma = Math.sqrt(v / dt);
+    return Number.isFinite(sigma) ? sigma : null; // σ per second, or honest NO-SIGN input
   }
   qtySince(t0) { let s = 0; for (const tr of this.trades) if (tr.t >= t0) s += tr.qty; return s; }
 }
