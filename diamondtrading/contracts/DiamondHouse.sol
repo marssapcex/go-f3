@@ -4,7 +4,7 @@
 // NO full-reserve gate, NO queue brake, NO pause: tickets sell even when pool = 0,
 // regardless of outstanding debt. The queue is a PUBLIC ledger of what the house owes:
 //   - stake is the player's money: returned immediately on settle (any outcome).
-//   - profit = (M−1)·S, fee = ρ·profit withheld at settle (ρ = 2% of profit, haircut only).
+//   - profit = (M−1)·S, fee = ρ·profit withheld at settle (ρ = 3.99% of profit).
 //   - WIN while queue empty: net profit paid from pool up to what pool holds, rest queues.
 //   - WIN while queue has debt: entire net profit appends to FIFO (no jumping the line).
 //   - losses go STRAIGHT to pool (papertrade rule); every settle pays up to
@@ -32,6 +32,7 @@ interface IOutcomeVerifier {
 }
 interface IRevenueSink {
     function notifyRevenue(uint256 amount) external;
+    function totalStaked() external view returns (uint256);
 }
 
 contract DiamondHouse {
@@ -74,7 +75,9 @@ contract DiamondHouse {
     bytes32 public constant QUOTE_TYPEHASH = keccak256(
         "Quote(uint8 classId,uint8 dir,uint128 stake,uint32 multX1e4,uint64 validUntil,bytes32 salt,address buyer)");
     uint256 public constant BPS = 10_000;
-    uint256 public constant FEE_BPS = 200;              // ρ = 2% of profit, withheld at settle
+    uint256 public constant FEE_BPS = 399;              // ρ = 3.99% of profit, withheld at settle
+    uint256 public constant FOUNDER_FEE_BPS = 99;       //   ↳ 0.99% streamed to founderWallet (settable later)
+                                                          //   ↳ remaining 3.00% streamed to DIAMOND stakers (revenueSink)
     uint256 public constant MAX_MULT_X1E4 = 10_000_000; // 1000x envelope (v2)
     uint256 public constant MIN_MULT_X1E4 = 10_500;     // 1.05x floor
     uint256 public constant REBATE_BPS = 1_500;         // EXPIRED rebates 15% of stake
@@ -89,6 +92,7 @@ contract DiamondHouse {
     address public quoterSigner;
     address public outcomeVerifier;
     address public revenueSink;
+    address public founderWallet;  // 0.99% stream destination; UNSET (0x0) ⇒ that slice goes to stakers too
 
     uint256 public pool;        // house lane (loses land here directly)
     uint256 public openStakes;  // player lane (unsettled stakes)
@@ -116,6 +120,7 @@ contract DiamondHouse {
                uint256 stake, uint32 multX1e4, uint64 expiry);
     event Settled(uint256 indexed id, uint8 outcome, uint256 stakeBack,
                   uint256 profitPaid, uint256 profitQueued, uint256 feeTaken);
+    event FeeStreamed(uint256 indexed id, uint256 founderAmt, uint256 stakerAmt);
     event Refunded(uint256 indexed id, uint256 stake);
     event Queued(uint256 indexed entryId, uint256 indexed ticketId, address owner, uint256 amount);
     event Dequeued(uint256 indexed entryId, address owner, uint256 amount);
@@ -228,16 +233,20 @@ contract DiamondHouse {
 
         if (o == Outcome.WON) {
             uint256 profit = uint256(t.multX1e4 - 10_000) * S / 10_000;
-            feeTaken = profit * FEE_BPS / BPS;            // ρ = 2% of profit
+            feeTaken = profit * FEE_BPS / BPS;            // ρ = 3.99% of profit
             uint256 netProfit = profit - feeTaken;
-            // ρ is a haircut on the PLAYER'S CLAIM (cash or queued promise) — it is never booked
-            // into a cash lane, because its cash was never in the contract when pool < net.
-            // The anchor records feeTaken from the Settled event (house keeps it by paying less).
+            // ρ is a haircut on the PLAYER'S CLAIM. A queued/partial claim never streams fee.
+            // On a fully paid claim, _streamFee sends only what the remaining pool can cover:
+            //   0.99% of profit → founderWallet (address(0) ⇒ re-routed to active stakers)
+            //   3.00% of profit → revenueSink (DIAMOND stakers, pull-based; retained if none stake)
+            // The mint anchor still records the full feeTaken haircut from Settled, independently
+            // of whether any fee cash was streamable.
             if (queueDebt == 0) {
                 profitPaid = netProfit > pool ? pool : netProfit; // pool pays what it can
                 pool -= profitPaid;
                 if (profitPaid < netProfit) _enqueue(t.owner, netProfit - profitPaid, uint64(id));
                 profitQueued = netProfit - profitPaid;
+                if (profitPaid == netProfit && feeTaken > 0) _streamFee(id, profit, feeTaken);
             } else {
                 _enqueue(t.owner, netProfit, uint64(id)); // no jumping the line
                 profitQueued = netProfit;
@@ -271,6 +280,25 @@ contract DiamondHouse {
         require(lanesIntact(), "lane drift");
     }
 
+    /// Streams only cash that actually has a destination. With no stakers the 3% slice
+    /// stays in pool instead of becoming unclaimable in RevenueSplit. With both destinations
+    /// active, total=feeTaken, so pre-settle pool must cover net+fee (= gross profit).
+    function _streamFee(uint256 id, uint256 profit, uint256 feeTaken) internal {
+        uint256 nominalFounder = profit * FOUNDER_FEE_BPS / BPS;
+        address founder = founderWallet;
+        address sink = revenueSink;
+        uint256 founderAmt = founder == address(0) ? 0 : nominalFounder;
+        uint256 stakerAmt = 0;
+        if (sink != address(0) && IRevenueSink(sink).totalStaked() > 0) {
+            stakerAmt = founder == address(0) ? feeTaken : feeTaken - nominalFounder;
+        }
+        uint256 total = founderAmt + stakerAmt;
+        if (total == 0 || pool < total) return; // no realized cash: retain in pool, never underflow
+        pool -= total;
+        if (founderAmt > 0) require(usdc.transfer(founder, founderAmt), "founder out");
+        if (stakerAmt > 0) IRevenueSink(sink).notifyRevenue(stakerAmt);
+        emit FeeStreamed(id, founderAmt, stakerAmt);
+    }
     // ---------------- FIFO payout queue ----------------
     function _enqueue(address who, uint256 amount, uint64 ticketId) internal {
         payoutQueue.push(QueueEntry({ owner: who, amount: uint128(amount), ticketId: ticketId }));
@@ -368,6 +396,7 @@ contract DiamondHouse {
         require(usdc.approve(s, type(uint256).max), "approve");
         emit ParamSet("revenueSink", uint256(uint160(s)));
     }
+    function setFounderWallet(address f) external onlyOwner { founderWallet = f; emit ParamSet("founderWallet", uint256(uint160(f))); }
 
     // ---------------- sig plumbing ----------------
     function _recoverSig(bytes32 digest, bytes calldata sig) internal pure returns (address) {

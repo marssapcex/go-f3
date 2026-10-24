@@ -6,6 +6,7 @@ const path = require("path");
 
 const art = (n) => JSON.parse(fs.readFileSync(path.join(__dirname, "..", "build", `${n}.json`), "utf8"));
 const U = (n) => BigInt(n) * 10n ** 6n;
+const E18 = (n) => BigInt(n) * 10n ** 18n;
 
 (async () => {
   const rpc = process.env.RPC || "http://127.0.0.1:8545";
@@ -27,6 +28,10 @@ const U = (n) => BigInt(n) * 10n ** 6n;
 
   const hAddr = await house.getAddress();
   const oAddr = await options.getAddress();
+  // Demo-only genesis allocation so the staker fee lane can be exercised immediately.
+  // The owner minter role is removed again before deployment finishes.
+  await (await diamond.setMinter(owner.address)).wait();
+  await (await diamond.mint(owner.address, E18(100_000))).wait();
   await (await diamond.setMinter(await dist.getAddress())).wait();
   await (await dist.setBudgetAttester(budgeter.address)).wait();
 
@@ -38,8 +43,15 @@ const U = (n) => BigInt(n) * 10n ** 6n;
   await (await options.setPriceVerifier(await pv.getAddress())).wait();
 
   const sink = await (await C("RevenueSplit", owner).deploy(await usdc.getAddress(), await diamond.getAddress())).waitForDeployment();
-  await (await house.setRevenueSink(await sink.getAddress())).wait();
+  const sinkAddr = await sink.getAddress();
+  await (await house.setRevenueSink(sinkAddr)).wait();
+  await (await options.setRevenueSink(sinkAddr)).wait();
   await (await sink.setHouse(hAddr)).wait();
+  await (await sink.setPusher(oAddr, true)).wait();
+  await (await diamond.setTransferAllowlist(sinkAddr, true)).wait();
+  await (await diamond.connect(owner).approve(sinkAddr, ethers.MaxUint256)).wait();
+  await (await sink.connect(owner).stake(E18(10_000))).wait();
+  // founderWallet deliberately remains address(0) on both engines; owner sets it later.
 
   // menu: 1 BTC 1000x, 2 ETH 1000x, 3 SOL 500x, 4 HYPE 500x, 5 BNB 200x, 6 SP500 100x, 7 XYZ100 100x
   const menu = [
@@ -66,8 +78,14 @@ const U = (n) => BigInt(n) * 10n ** 6n;
       USDC: await usdc.getAddress(), DIAMOND: await diamond.getAddress(),
       Distributor: await dist.getAddress(), House: hAddr, Options: oAddr,
       OutcomeVerifier: await ov.getAddress(), PriceVerifier: await pv.getAddress(),
-      RevenueSplit: await sink.getAddress(),
+      RevenueSplit: sinkAddr,
     },
+    fee: {
+      totalBps: 399, founderBps: 99, stakerBps: 300,
+      founderWallet: ethers.ZeroAddress,
+      note: "0.99% founder / 3.00% stakers; founder unset folds into active stakers",
+    },
+    demoStaking: { mintedToOwner: "100000 DIAMOND", stakedByOwner: "10000 DIAMOND" },
     keys: { quoter: quoter.address, attesters: [att1.address, att2.address, att3.address], budgeter: budgeter.address },
     note: "demo only — ganache deterministic mnemonic, DO NOT send real funds",
   };

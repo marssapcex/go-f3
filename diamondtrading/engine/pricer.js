@@ -1,7 +1,7 @@
 // GALE pricer: turn measured σ into a fair multiplier, then shave by the published edge ρ.
 // Model [ASSUMED]: zero-drift absorbing-barrier first-passage (reflection principle):
 //   P_bust(L, σ, τ) ≈ 2·Φ(−(1/L)/(σ·√τ))        (touch of the ∓1/L band within τ)
-// Fair digital multiplier M_fair = 1/(1−P_bust); offered M = M_fair·(1−ρ), ρ = 2% default.
+// Fair digital multiplier M_fair = 1/(1−P_bust); offered M = M_fair·(1−ρ), ρ = 3.99% default.
 // The clamp table (1.05x–25x global, per-class on-chain) bounds everything again on-chain.
 
 function erf(x) {
@@ -18,7 +18,7 @@ export function bustProb(leverage, sigmaPerSec, tauSec) {
   return Math.min(0.9999, 2 * Phi(-z));
 }
 
-export function offerMultiplier(leverage, sigmaPerSec, tauSec, rho = 0.02) {
+export function offerMultiplier(leverage, sigmaPerSec, tauSec, rho = 0.0399) {
   const pBust = bustProb(leverage, sigmaPerSec, tauSec);
   const mFair = 1 / (1 - pBust);
   return { pBust, mFair, mOffer: mFair * (1 - rho) };

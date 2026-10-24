@@ -1,7 +1,7 @@
 // DiamondTrading v3 property fuzz — transparent FIFO queue invariants (no brake, no pause).
 // Mirror-lane design: every successful op updates a JS shadow of ALL money lanes;
 // after EVERY op we assert on-chain == shadow:
-//   G1  pool / sideBucket / openStakes / queueDebt exact mirror
+//   G1  pool / openStakes / queueDebt exact mirror, including streamed fees
 //   G2  lanesIntact(): B == pool + open (on-chain view)
 //   G3  WON while debt>0 ⇒ full net profit queued (no cut-in-line); else pool pays min(pool,net)
 //   G4  FIFO: Dequeued entry ids strictly increasing (oldest first)
@@ -31,7 +31,7 @@ const SEED = Number(process.env.SEED || 1337);
 const OPS = Number(process.env.OPS || 150);
 const U = (n) => BigInt(n) * 10n ** 6n;
 const TTLS = [30, 60, 120, 300];
-const FEE_BPS = 200n, BPS = 10_000n;
+const FEE_BPS = 399n, FOUNDER_FEE_BPS = 99n, BPS = 10_000n;
 
 (async () => {
   const r = rng32(SEED);
@@ -70,11 +70,19 @@ const FEE_BPS = 200n, BPS = 10_000n;
     [att1.address, att2.address, att3.address], 2, houseAddr)).waitForDeployment();
   await (await house.setOutcomeVerifier(await verifier.getAddress())).wait();
   await (await house.setClassCfg(1, 10_000_000, U(50_000), true)).wait(); // 1000x env, $50k profit cap
-  const edge = await (await C("EdgeToken", owner).deploy()).waitForDeployment();
-  const sink = await (await C("RevenueSplit", owner).deploy(await usdc.getAddress(), await edge.getAddress())).waitForDeployment();
-  await (await house.setRevenueSink(await sink.getAddress())).wait();
+  const diamond = await (await C("DiamondToken", owner).deploy()).waitForDeployment();
+  const sink = await (await C("RevenueSplit", owner).deploy(await usdc.getAddress(), await diamond.getAddress())).waitForDeployment();
+  const sinkAddr = await sink.getAddress();
+  await (await house.setRevenueSink(sinkAddr)).wait();
   await (await sink.setHouse(houseAddr)).wait();
+  await (await diamond.setMinter(owner.address)).wait();
+  await (await diamond.mint(sinkSigner.address, 1_000n * 10n ** 18n)).wait();
+  await (await diamond.setTransferAllowlist(sinkAddr, true)).wait();
+  await (await diamond.connect(sinkSigner).approve(sinkAddr, ethers.MaxUint256)).wait();
+  await (await sink.connect(sinkSigner).stake(1_000n * 10n ** 18n)).wait();
+  await (await house.setFounderWallet(owner.address)).wait();
   await (await house.setTargetPool(U(20_000))).wait();      // small target so distribute triggers in-fuzz
+  const founder0 = await usdc.balanceOf(owner.address), sink0 = await usdc.balanceOf(sinkAddr);
 
   const vDomain = { name: "DiamondOutcome", version: "1", chainId: 31337, verifyingContract: await verifier.getAddress() };
   const oTypes = { Outcome: [ { name: "ticketId", type: "uint256" }, { name: "outcome", type: "uint8" }, { name: "house", type: "address" } ] };
@@ -96,6 +104,7 @@ const FEE_BPS = 200n, BPS = 10_000n;
   let entrySeq = 0, lastDeqId = -1;
   const open = [];          // { id, buyer, stake, mult, expiry }
   let checks = 0, buysOk = 0, settleOk = 0, refunds = 0, harvests = 0, dists = 0, reverts = 0, deqTotal = 0;
+  let founderStream = 0n, stakerStream = 0n, distributedUsd = 0n;
 
   function laneCheck(tag) {
     return Promise.all([house.pool(), house.openStakes(), house.queueDebt(), house.lanesIntact()])
@@ -170,8 +179,9 @@ const FEE_BPS = 200n, BPS = 10_000n;
     const deqToOwner = deq.filter((ev) => ev.args[1] === t.buyer.address)
       .reduce((s, ev) => s + ev.args[2], 0n);
     if (o === 1) {
-      const { net } = np(t.stake, t.mult);
+      const { profit, fee, net } = np(t.stake, t.mult);
       let paid;
+      let streamedFounder = 0n, streamedStaker = 0n;
       if (debtBefore > 0n) {                                   // G3: no cut-in-line
         paid = 0n;
         queue.push({ entryId: entrySeq++, amount: net, ticketId: Number(t.id), owner: t.buyer });
@@ -182,7 +192,20 @@ const FEE_BPS = 200n, BPS = 10_000n;
         if (paid < net) {
           queue.push({ entryId: entrySeq++, amount: (net - paid), ticketId: Number(t.id), owner: t.buyer });
           sh.debt += (net - paid);
+        } else if (fee > 0n && sh.pool >= fee) {
+          // founder + active staker sink are both configured in this fuzz: total stream = fee.
+          streamedFounder = profit * FOUNDER_FEE_BPS / BPS;
+          streamedStaker = fee - streamedFounder;
+          sh.pool -= fee;
         }
+      }
+      const feeEvents = rc.logs.filter((l) => l.fragment?.name === "FeeStreamed");
+      if (streamedFounder + streamedStaker > 0n) {
+        if (feeEvents.length !== 1 || feeEvents[0].args[1] !== streamedFounder || feeEvents[0].args[2] !== streamedStaker)
+          throw new Error(`G7 fee stream mismatch @ticket ${t.id}`);
+        founderStream += streamedFounder; stakerStream += streamedStaker; checks++;
+      } else if (feeEvents.length !== 0) {
+        throw new Error(`G7 unexpected fee stream @ticket ${t.id}`);
       }
       const got = (await usdc.balanceOf(t.buyer.address)) - b0;
       if (got !== t.stake + paid + deqToOwner) throw new Error(`G3 payout wrong: id=${t.id} got ${got} expect ${t.stake + paid + deqToOwner}`);
@@ -240,7 +263,7 @@ const FEE_BPS = 200n, BPS = 10_000n;
       await (await H(owner).distributeRevenue(amt)).wait();
       const moved = (await usdc.balanceOf(await sink.getAddress())) - b0;
       if (moved !== amt) throw new Error(`G6 distribution moved ${moved} != ${amt}`);
-      sh.pool -= amt; dists++;
+      sh.pool -= amt; distributedUsd += amt; dists++;
     } catch (e) { reverts++; }
   }
 
@@ -284,7 +307,12 @@ const FEE_BPS = 200n, BPS = 10_000n;
     } catch (e) { reverts++; }
   }
   await laneCheck("teardown");
+  const founderDelta = (await usdc.balanceOf(owner.address)) - founder0;
+  const sinkDelta = (await usdc.balanceOf(sinkAddr)) - sink0;
+  if (founderDelta !== founderStream) throw new Error(`G7 founder balance ${founderDelta} != ${founderStream}`);
+  if (sinkDelta !== stakerStream + distributedUsd)
+    throw new Error(`G7 sink balance ${sinkDelta} != fees ${stakerStream} + distributions ${distributedUsd}`);
   console.log(`fuzz-v3 SEED=${SEED} OPS=${OPS}: OK — ${checks} checks, ${buysOk} buys, ${settleOk} settles,` +
     ` ${refunds} stall refunds, ${harvests} harvests, ${deqTotal} FIFO payments (follow-ups ${followUp}),` +
-    ` ${dists} distributions | end: pool=${sh.pool} debt=${sh.debt} (${reverts} expected reverts)`);
+    ` ${dists} distributions, founder=${founderStream} stakerFees=${stakerStream} | end: pool=${sh.pool} debt=${sh.debt} (${reverts} expected reverts)`);
 })().catch((e) => { console.error("FUZZ FAILURE:", e.message); process.exit(1); });

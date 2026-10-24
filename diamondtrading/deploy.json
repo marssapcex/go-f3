@@ -2,14 +2,25 @@
   "chainId": 31337,
   "rpc": "http://127.0.0.1:8545",
   "contracts": {
-    "USDC": "0x5017A545b09ab9a30499DE7F431DF0855bCb7275",
-    "DIAMOND": "0x86072CbFF48dA3C1F01824a6761A03F105BCC697",
-    "Distributor": "0xFF6049B87215476aBf744eaA3a476cBAd46fB1cA",
-    "House": "0xA586074FA4Fe3E546A132a16238abe37951D41fE",
-    "Options": "0x2D8BE6BF0baA74e0A907016679CaE9190e80dD0A",
-    "OutcomeVerifier": "0xaf5C4C6C7920B4883bC6252e9d9B8fE27187Cf68",
-    "PriceVerifier": "0xDDb64fE46a91D46ee29420539FC25FD07c5FEa3E",
-    "RevenueSplit": "0x22d5C8BdD4346b390014a07109a8F830094d4abf"
+    "USDC": "0xe78A0F7E598Cc8b0Bb87894B0F60dD2a88d6a8Ab",
+    "DIAMOND": "0x5b1869D9A4C187F2EAa108f3062412ecf0526b24",
+    "Distributor": "0xCfEB869F69431e42cdB54A4F4f105C19C080A601",
+    "House": "0x254dffcd3277C0b1660F6d42EFbB754edaBAbC2B",
+    "Options": "0xC89Ce4735882C9F0f0FE26686c53074E09B0D550",
+    "OutcomeVerifier": "0x0290FB167208Af455bB137780163b7B7a9a10C16",
+    "PriceVerifier": "0x67B5656d60a809915323Bf2C40A8bEF15A152e3e",
+    "RevenueSplit": "0xA57B8a5584442B467b4689F1144D269d096A3daF"
+  },
+  "fee": {
+    "totalBps": 399,
+    "founderBps": 99,
+    "stakerBps": 300,
+    "founderWallet": "0x0000000000000000000000000000000000000000",
+    "note": "0.99% founder / 3.00% stakers; founder unset folds into active stakers"
+  },
+  "demoStaking": {
+    "mintedToOwner": "100000 DIAMOND",
+    "stakedByOwner": "10000 DIAMOND"
   },
   "keys": {
     "quoter": "0x02484cb50AAC86Eae85610D6f4Bf026f30f6627D",

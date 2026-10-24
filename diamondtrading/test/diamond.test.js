@@ -85,7 +85,7 @@ async function main() {
   };
   const lanes = async (tag) => ok(await house.lanesIntact(), `lanes intact ${tag}`);
 
-  const netProfit = (S, M) => { const p = S * (BigInt(Math.round(M * 1e4)) - 10_000n) / 10_000n; return { p, fee: p * 200n / 10_000n, net: p - p * 200n / 10_000n }; };
+  const netProfit = (S, M) => { const p = S * (BigInt(Math.round(M * 1e4)) - 10_000n) / 10_000n; return { p, fee: p * 399n / 10_000n, net: p - p * 399n / 10_000n }; };
 
   // ============ [SALES] v2 point: pool=0 playable + brakes ============
   console.log("\n[SALES] pool=0 sales, no QMAX (v3), no pause switch, class caps, quote rules");
@@ -122,8 +122,9 @@ async function main() {
     const s0 = await sigh(q1, 1);
     await settleRaw(q1, 1, s0);
     const debt1 = await house.queueDebt();
-    // b2 $100 @ 50x: profit 4900, fee 98, net 4802; pool 1000 pays 1000 → queue 3802
-    ok(debt1 === U(3_802), "whale win queues exact shortfall 3802 (net 4802 − pool 1000)");
+    // b2 $100 @ 50x: profit 4900, fee 3.99%, net; pool 1000 pays 1000 → rest queues
+    const sq1 = netProfit(U(100), 50);
+    ok(debt1 === sq1.net - U(1_000), "whale win queues exact shortfall (net − pool 1000)");
     ok((await house.pool()) === 0n, "pool spent first; fee is a claim haircut, no cash lane");
     await lanes("after queued win");
     const r7v = await qTicket(b3, 10, 50);
@@ -135,9 +136,108 @@ async function main() {
     ok(debtPreB3 - (await house.queueDebt()) === U(10), "inline harvest paid the lost stake (10) into FIFO from pool");
     // claimInfo: user can read own queue position + owed amount (frontend only notifies when hasDebt)
     const ci = await house.claimInfo(q1);
-    ok(ci.hasDebt && ci.position === 1n && ci.amountOwed === U(3_802) - U(10), "claimInfo: whale is #1 in line, owed 3792 post-inline");
+    ok(ci.hasDebt && ci.position === 1n && ci.amountOwed === sq1.net - U(1_010), "claimInfo: whale is #1 in line, exact owed post-inline");
     const ci2 = await house.claimInfo(2n);
     ok(!ci2.hasDebt && ci2.amountOwed === 0n && ci2.totalDebt > 0n, "claimInfo: loser ticket has no debt but sees total house debt");
+  }
+
+  // ============ [FEE-SPLIT] 3.99% stream: 0.99 founder / 3 stakers ============
+  console.log("\n[FEE-SPLIT] 3.99% ρ streaming — founder wallet settable later, unset ⇒ stakers take all");
+  {
+    const h4 = await (await C("DiamondHouse", owner).deploy(await usdc.getAddress(), quoterW.address)).waitForDeployment();
+    const h4Addr = await h4.getAddress();
+    const ov4 = await (await C("MultiAttesterVerifier", owner).deploy(
+      [att1.address, att2.address, att3.address], 2, h4Addr)).waitForDeployment();
+    await (await h4.setOutcomeVerifier(await ov4.getAddress())).wait();
+    await (await h4.setClassCfg(1, 10_000_000, U(1_000_000), true)).wait();
+    const diamond4 = await (await C("DiamondToken", owner).deploy()).waitForDeployment();
+    const sink4 = await (await C("RevenueSplit", owner).deploy(await usdc.getAddress(), await diamond4.getAddress())).waitForDeployment();
+    await (await h4.setRevenueSink(await sink4.getAddress())).wait();
+    await (await sink4.setHouse(h4Addr)).wait();
+    const H4 = (s) => h4.connect(s);
+    for (const b of [b1, b2, lp1]) await (await usdc.connect(b).approve(h4Addr, ethers.MaxUint256)).wait();
+    const Q4 = new Quoter(quoterW, { houseAddr: h4Addr, chainId: 31337 });
+    const A4a = new Attester(att1, { outcomeVerifierAddr: await ov4.getAddress(), chainId: 31337, houseAddr: h4Addr });
+    const A4b = new Attester(att2, { outcomeVerifierAddr: await ov4.getAddress(), chainId: 31337, houseAddr: h4Addr });
+    const sigh4 = (id, o) => Promise.all([A4a.signOutcome(id, o), A4b.signOutcome(id, o)]);
+    const buy4 = async (who, suIn, m, ttl = 60) => {
+      const r = await Q4.signTicket({ classId: 1, dir: 0, stake: U(suIn), multX1e4: x(m),
+        validUntil: (await now()) + 25, salt: ethers.randomBytes(32), buyer: who.address });
+      const rc = await (await H4(who).buyTicket(r.q, r.sig, x(m), 60)).wait();
+      return rc.logs.find((l) => l.fragment?.name === "Sold").args[0];
+    };
+
+    const sinkAddr = await sink4.getAddress();
+    const boundary = netProfit(U(1_000), 10);
+
+    // (0a) gross-covered win but NO stakers and founder unset: no destination, fee stays in pool.
+    await (await H4(lp1).lpDeposit(boundary.p)).wait();
+    const wNoStaker = await buy4(b1, 1_000, 10);
+    const rNoStaker = await (await H4(relayer).settleWithProof(wNoStaker, 1, await sigh4(wNoStaker, 1))).wait();
+    ok(!rNoStaker.logs.some((l) => l.fragment?.name === "FeeStreamed") &&
+       (await h4.pool()) === boundary.fee && (await usdc.balanceOf(sinkAddr)) === 0n,
+       "no stakers + founder unset: fee remains in pool, nothing is stranded in sink");
+
+    await (await diamond4.setMinter(owner.address)).wait();
+    await (await diamond4.mint(b3.address, 1_000n * 10n ** 18n)).wait();
+    await (await diamond4.setTransferAllowlist(sinkAddr, true)).wait();
+    await (await diamond4.connect(b3).approve(sinkAddr, ethers.MaxUint256)).wait();
+    await (await sink4.connect(b3).stake(1_000n * 10n ** 18n)).wait();
+
+    // (0b) pool == net only: winner is paid, but there is no cash left for the fee stream.
+    await (await H4(lp1).lpDeposit(boundary.net - boundary.fee)).wait();
+    ok((await h4.pool()) === boundary.net, "boundary setup: pool exactly equals the next net claim");
+    const wb = await buy4(b1, 1_000, 10);
+    const rb = await (await H4(relayer).settleWithProof(wb, 1, await sigh4(wb, 1))).wait();
+    ok(!rb.logs.some((l) => l.fragment?.name === "FeeStreamed") &&
+       (await h4.pool()) === 0n && (await h4.queueDebt()) === 0n,
+       "pool=net pays winner without underflow or imaginary fee stream");
+    ok((await sink4.claimable(b3.address)) === 0n, "net-only coverage leaves staker rewards at zero");
+
+    await (await H4(lp1).lpDeposit(U(200_000))).wait();   // deep pool
+
+    // (1) covered win, founder UNSET ⇒ entire 3.99% streams to stakers' sink
+    const w = await buy4(b1, 1_000, 10);                  // profit 9,000; fee 359.1→359; net 8,641 covered
+    const v1 = netProfit(U(1_000), 10);
+    const rc1 = await (await H4(relayer).settleWithProof(w, 1, await sigh4(w, 1))).wait();
+    const ev1 = rc1.logs.find((l) => l.fragment?.name === "FeeStreamed");
+    ok(ev1 !== undefined, "FeeStreamed emitted on fully-covered win");
+    ok(ev1.args[1] === 0n && ev1.args[2] === v1.fee, "founder unset ⇒ whole 3.99% to stakers");
+    ok((await usdc.balanceOf(sinkAddr)) === v1.fee, "sink pulled the staker slice (pull-based)");
+    ok((await sink4.claimable(b3.address)) === v1.fee, "staker claimable equals the full 3.99% while founder unset");
+    await ok(await h4.lanesIntact(), "lanes after stream-1");
+
+    // (2) founder set ⇒ 0.99% founder, 3.00% stakers
+    await (await h4.connect(owner).setFounderWallet(b4.address)).wait();
+    const founderIsSet = (await h4.founderWallet()) === b4.address;
+    ok(founderIsSet, "setFounderWallet writable (will be multisig/EOA at launch)");
+    const w2 = await buy4(b2, 500, 20);                   // profit 9,500; fee 379.05→379
+    const v2 = netProfit(U(500), 20);
+    const f0 = await usdc.balanceOf(b4.address), s0 = await usdc.balanceOf(sinkAddr);
+    const rc2 = await (await H4(relayer).settleWithProof(w2, 1, await sigh4(w2, 1))).wait();
+    const ev2 = rc2.logs.find((l) => l.fragment?.name === "FeeStreamed");
+    const fExp = v2.p * 99n / 10_000n;
+    ok(ev2.args[1] === fExp && ev2.args[2] === v2.fee - fExp, "0.99% founder / 3.00% stakers split exact");
+    ok((await usdc.balanceOf(b4.address)) - f0 === fExp, "founder wallet received 0.99% of profit");
+    ok((await usdc.balanceOf(sinkAddr)) - s0 === v2.fee - fExp, "stakers received the 3% slice");
+    const expectedRewards = v1.fee + v2.fee - fExp;
+    ok((await sink4.claimable(b3.address)) === expectedRewards, "staker claimable accumulates 3.99% + 3.00% exactly");
+    const stakerUsdc0 = await usdc.balanceOf(b3.address);
+    await (await sink4.connect(b3).claimReward()).wait();
+    ok((await usdc.balanceOf(b3.address)) - stakerUsdc0 === expectedRewards,
+       "staker actually claims the streamed USDC rewards");
+    ok(v2.fee === v2.p * 399n / 10_000n && v2.fee > v2.p * 200n / 10_000n,
+       "ρ is now 3.99% (below recalled competitor 4-6% range)");
+
+    // (3) queued win ⇒ NOTHING streams (fee isn't realized cash during a debt phase)
+    // empty the pool: LP withdraw... simpler: whale win > pool
+    const w3 = await buy4(b1, 3_000, 100);                // profit 297k > pool
+    const f1 = await usdc.balanceOf(b4.address), s1 = await usdc.balanceOf(sinkAddr);
+    await (await H4(relayer).settleWithProof(w3, 1, await sigh4(w3, 1))).wait();
+    ok((await usdc.balanceOf(b4.address)) === f1 && (await usdc.balanceOf(sinkAddr)) === s1,
+       "debt-phase win streams zero fee (no cash was realized)");
+    ok((await h4.queueDebt()) > 0n, "debt exists (shortfall queued)");
+    await ok(await h4.lanesIntact(), "lanes end of [FEE-SPLIT]");
   }
 
   // ============ [Q1] pool=0 whale, FIFO, harvest, cut-in-line ============
@@ -162,7 +262,7 @@ async function main() {
       const rc = await (await H2(who).buyTicket(r.q, r.sig, x(m), ttl)).wait();
       return rc.logs.find((l) => l.fragment?.name === "Sold").args[0];
     };
-    const np = (su, m) => { const p = U(su) * (x(m) - 10_000n) / 10_000n; const f = p * 200n / 10_000n; return { p, fee: f, net: p - f }; };
+    const np = (su, m) => { const p = U(su) * (x(m) - 10_000n) / 10_000n; const f = p * 399n / 10_000n; return { p, fee: f, net: p - f }; };
     await (await H2(lp1).lpDeposit(U(1_000))).wait();      // pool = 1,000
 
     // (1) whale b1 $1,000 @ 20x: profit 19,000; fee 380; net 18,620 → pool 1,000 now, queue 17,620
@@ -193,7 +293,7 @@ async function main() {
     }
     ok((await h2.queueDebt()) === debt, "four in-debt wins fully queued behind the whale");
     const cb2 = await h2.claimInfo(w2ids[0]);
-    ok(cb2.hasDebt && cb2.position === 2n && cb2.amountOwed === (x(5) - 10_000n) * U(100) / 10_000n * 98n / 100n,
+    ok(cb2.hasDebt && cb2.position === 2n && cb2.amountOwed === np(100, 5).net,
        "claimInfo: first small winner is #2, full net queued");
     ok(await h2.lanesIntact(), "lanes after in-debt wins");
 
@@ -211,30 +311,35 @@ async function main() {
     await (await H2(b4).harvest(2)).wait();             // empty pool → no-op
     ok((await h2.queueDebt()) === d0, "harvest with empty pool is a no-op");
 
-    // (4) b4 loses 17,000 → inline: whale done (16,620), then e1 12 remaining 380 → e1 left 12
+    // (4) b4 loses 17,000 → whale fully paid at this point (its remainder ≈16.2k), smalls partially
     const l2 = await buy2(b4, 17_000, 2);
     await (await H2(relayer).settleWithProof(l2, 2, await sigh2(l2, 2))).wait();
     debt -= U(17_000);
-    ok((await h2.queueDebt()) === debt, "inline-4: whale fully paid, b2 e1 partially (12 left)");
+    ok((await h2.queueDebt()) === debt, "inline-4: whale fully paid, small entries partially paid");
+    const cwMid = await h2.claimInfo(w1);
+    ok(!cwMid.hasDebt, "claimInfo: whale already paid in full, stops reporting");
 
-    // (5) b3 loses 1,000 → pays e1 12, e2 392, e3 392, e4 204/392 → debt 188
+    // (5) b3 loses 1,000 → pool 1,000, inline pays every remaining entry (total owed < 1,000)
+    const owedL3 = debt;
     const l3 = await buy2(b3, 1_000, 2);
     await (await H2(relayer).settleWithProof(l3, 2, await sigh2(l3, 2))).wait();
-    debt -= U(1_000);
-    ok((await h2.queueDebt()) === debt, "inline-4 capped at 4 entries; one queue stub remains (188)");
+    debt = 0n;
+    ok((await h2.queueDebt()) === 0n, "1,000-loss clears the remaining small queue");
+    ok((await h2.pool()) === U(1_000) - owedL3, "loser surplus (1000 − owed) stays in pool");
 
-    // (6) b4 loses 200 → pool 200 → pays stub 188; queue clean, pool keeps the leftover 12
+    // (6) b4 loses 200 → everything straight to pool (queue already clean)
+    const poolV = await h2.pool();
     const l4x = await buy2(b4, 200, 2);
     await (await H2(relayer).settleWithProof(l4x, 2, await sigh2(l4x, 2))).wait();
-    ok((await h2.queueDebt()) === 0n, "queue fully cleared by 200-loss");
-    ok((await h2.pool()) === U(12), "leftover 12 stays in pool (v3: no sweep step)");
+    ok((await h2.queueDebt()) === 0n, "queue stays clean");
+    ok((await h2.pool()) === poolV + U(200), "clean-phase loss feeds pool directly (papertrade)");
     const cwDone = await h2.claimInfo(w1);
-    ok(!cwDone.hasDebt && cwDone.amountOwed === 0n, "claimInfo: whale fully paid, nothing reported");
+    ok(!cwDone.hasDebt && cwDone.amountOwed === 0n, "claimInfo: nothing to report for paid whale");
     ok(await h2.lanesIntact(), "lanes after queue clear");
 
     // exact player totals
     const b1Tot = await usdc.balanceOf(b1.address);
-    ok(b1Tot === b1_0 + U(1_000) + w1v.net, "whale received stake + FULL net profit via FIFO (16,620+1,000+1,000+1,000)");
+    ok(b1Tot === b1_0 + U(1_000) + w1v.net, "whale received stake + FULL net profit via inline FIFO pays");
     ok(true, "(b2 totals verified per-step above)");
 
     // (6) settle-once + refund-once

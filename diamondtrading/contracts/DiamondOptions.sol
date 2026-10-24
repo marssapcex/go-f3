@@ -5,7 +5,7 @@
 //     CALL: pay = maxPay · min(C−K, band·K)/(band·K)   (0 if C ≤ K)
 //     PUT:  pay = maxPay · min(K−C, band·K)/(band·K)   (0 if C ≥ K)
 //   maxPay = premium × M (M ≤ class cap, ≤ 25x envelope — ramps already saturate at the band).
-//   ρ = 2% of the payout withheld at settle; net payout pays from pool if the queue is clean,
+//   ρ = 3.99% of the payout withheld at settle; net payout pays from pool if the queue is clean,
 //   else goes entirely to the FIFO (no jumping the line). Premiums are house income → pool,
 //   directly, always (papertrade rule). No QMAX, no pause: positions sell regardless of debt.
 //   claimInfo(option-id) reports queue position + amount owed.
@@ -19,6 +19,11 @@ interface IERC20MinO {
 }
 interface IPriceVerifier {
     function verifyOpt(uint256 optionId, uint64 closePx, bytes[] calldata sigs) external view returns (bool);
+}
+
+interface IRevenueSinkO {
+    function notifyRevenue(uint256 amount) external;
+    function totalStaked() external view returns (uint256);
 }
 
 contract DiamondOptions {
@@ -52,7 +57,8 @@ contract DiamondOptions {
     struct ClassCfg { uint32 maxMultX1e4; uint64 payCap; bool enabled; }
 
     uint256 public constant BPS = 10_000;
-    uint256 public constant FEE_BPS = 200;             // ρ = 2% of payout
+    uint256 public constant FEE_BPS = 399;             // ρ = 3.99% of payout
+    uint256 public constant FOUNDER_FEE_BPS = 99;      // 0.99% → founderWallet (0x0 ⇒ to stakers); 3.00% → stakers
     uint256 public constant MAX_MULT_X1E4 = 250_000;   // 25x envelope (ramps saturate at band)
     uint256 public constant MIN_MULT_X1E4 = 10_500;
     uint256 public constant MIN_BAND_BPS  = 5;         // 0.05%
@@ -76,6 +82,8 @@ contract DiamondOptions {
     uint256 public pool;
     uint256 public openPremiums;  // player lane: unsettled premiums
     uint256 public queueDebt;
+    address public revenueSink;
+    address public founderWallet;
 
 
     Option_[]   public options;
@@ -91,6 +99,7 @@ contract DiamondOptions {
                 uint256 premium, uint256 maxPay, uint64 strike, uint32 bandBps, uint64 expiry);
     event OSettled(uint256 indexed id, uint64 closePx, uint256 payout,
                    uint256 paidNow, uint256 queued, uint256 feeTaken);
+    event FeeStreamed(uint256 indexed id, uint256 founderAmt, uint256 stakerAmt);
     event ORefunded(uint256 indexed id, uint256 premium);
     event OQueued(uint256 indexed entryId, uint256 indexed optionId, address owner, uint256 amount);
     event ODequeued(uint256 indexed entryId, address owner, uint256 amount);
@@ -205,6 +214,7 @@ contract DiamondOptions {
                 paidNow = net > pool ? pool : net;
                 pool -= paidNow;
                 if (paidNow < net) _enqueue(o.owner, net - paidNow, uint64(id));
+                if (paidNow == net && feeTaken > 0) _streamFee(id, payout, feeTaken);
             } else {
                 _enqueue(o.owner, net, uint64(id));
             }
@@ -217,6 +227,25 @@ contract DiamondOptions {
         require(lanesIntact(), "lane drift");
     }
 
+    /// Streams only cash that actually has a destination. With no stakers the 3% slice
+    /// stays in pool instead of becoming unclaimable in RevenueSplit. With both destinations
+    /// active, total=feeTaken, so pre-settle pool must cover net+fee (= gross payout).
+    function _streamFee(uint256 id, uint256 payoutAmt, uint256 feeTaken) internal {
+        uint256 nominalFounder = payoutAmt * FOUNDER_FEE_BPS / BPS;
+        address founder = founderWallet;
+        address sink = revenueSink;
+        uint256 founderAmt = founder == address(0) ? 0 : nominalFounder;
+        uint256 stakerAmt = 0;
+        if (sink != address(0) && IRevenueSinkO(sink).totalStaked() > 0) {
+            stakerAmt = founder == address(0) ? feeTaken : feeTaken - nominalFounder;
+        }
+        uint256 total = founderAmt + stakerAmt;
+        if (total == 0 || pool < total) return; // no realized cash: retain in pool, never underflow
+        pool -= total;
+        if (founderAmt > 0) require(usdc.transfer(founder, founderAmt), "founder out");
+        if (stakerAmt > 0) IRevenueSinkO(sink).notifyRevenue(stakerAmt);
+        emit FeeStreamed(id, founderAmt, stakerAmt);
+    }
     /// Attester stall > 24h past expiry ⇒ premium back verbatim.
     function refundAfterStall(uint256 id) external nonReentrant {
         Option_ storage o = options[id];
@@ -262,6 +291,12 @@ contract DiamondOptions {
         emit ParamSet("classCfg", uint256(classId));
     }
     function setQuoter(address qa) external onlyOwner { require(qa != address(0), "zero"); quoterSigner = qa; emit ParamSet("quoter", uint256(uint160(qa))); }
+    function setRevenueSink(address s) external onlyOwner {
+        revenueSink = s;
+        require(usdc.approve(s, type(uint256).max), "approve");
+        emit ParamSet("revenueSink", uint256(uint160(s)));
+    }
+    function setFounderWallet(address f) external onlyOwner { founderWallet = f; emit ParamSet("founderWallet", uint256(uint160(f))); }
     function setPriceVerifier(address v) external onlyOwner { require(v != address(0), "zero"); priceVerifier = v; emit ParamSet("verifier", uint256(uint160(v))); }
 
     function _recoverSig(bytes32 digest, bytes calldata sig) internal pure returns (address) {

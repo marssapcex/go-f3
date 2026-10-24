@@ -26,12 +26,12 @@ const breaker = new SpikeBreaker();
 const brk = breaker.allowed("BTC", sigma, 0.0004, t0);
 
 const L = 1000, tau = 60;
-const { pBust, mFair, mOffer } = offerMultiplier(L, sigma, tau, 0.02);
+const { pBust, mFair, mOffer } = offerMultiplier(L, sigma, tau, 0.0399);
 const m = clampMultiplier(mOffer, { classMaxX: 25 });
 const ceil = payoutCeiling({ treasuryUsd: T, lambdaUsdPerSec: 14_200, omegaSec: omega,
   dualRead: route.dualRead });
 
 console.log(`G4 breaker: ${brk ? "OPEN" : "TRIPPED"} (σ_now=${sigma.toExponential(2)})`);
 console.log(`price: L=${L} τ=${tau}s  P(bust)=${pBust.toFixed(3)}  M_fair=${mFair.toFixed(3)}x` +
-  `  M_offer=${m ? m.toFixed(3) + "x" : "REFUSED"}  (ρ=2%)`);
+  `  M_offer=${m ? m.toFixed(3) + "x" : "REFUSED"}  (ρ=3.99%)`);
 console.log(`G3 ceiling: maxPayout ≤ $${ceil.toFixed(0)} per position (T=$${T}, ω=${omega}s)`);

@@ -11,13 +11,14 @@ interface IERC20MinR {
 /// positive diamond in USDC. Cash-basis only: the house pushes USDC in via notifyRevenue();
 /// nothing here is ever read INTO the house's solvency accounting (one-directional flow,
 /// audit lesson H-01/H-02/KV-06: no cross-domain cursors).
-/// Weekly netting semantics are implemented by the pusher (house treasury only pushes on
-/// net-positive weeks, loss weeks carry forward off-chain).
+/// Authorized House/Options engines pull-transfer their own USDC into this contract atomically.
+/// Per-win fee streams and the owner's surplus waterfall share the same cumulative-index rewards.
 contract RevenueSplit {
     IERC20MinR public immutable usdc;
     IERC20MinR public immutable diamond;
     address public owner;
-    address public house;           // only house may push revenue
+    address public house;           // primary house may push revenue
+    mapping(address => bool) public pusher;  // additional payout engines (options…) allowed to push
 
     uint64 public constant UNBOND_DELAY = 7 days;
 
@@ -41,6 +42,7 @@ contract RevenueSplit {
     event RevenueNotified(uint256 amount, uint256 newIndex);
     event RewardClaimed(address indexed who, uint256 amount);
     event HouseSet(address indexed house);
+    event PusherSet(address indexed who, bool allowed);
 
     constructor(address _usdc, address _diamond) {
         usdc = IERC20MinR(_usdc);
@@ -49,6 +51,7 @@ contract RevenueSplit {
     }
 
     function setHouse(address h) external onlyOwner { require(h != address(0), "zero"); house = h; emit HouseSet(h); }
+    function setPusher(address h, bool allowed) external onlyOwner { pusher[h] = allowed; emit PusherSet(h, allowed); }
 
     function stake(uint256 amount) external nonReentrant {
         _settleReward(msg.sender);
@@ -78,11 +81,10 @@ contract RevenueSplit {
         emit Withdrawn(msg.sender, amt);
     }
 
-    /// House-only revenue push (USDC already transferred to this contract before calling,
-    /// or transfer+notify atomically via house).
+    /// Authorized engines only; pulls amount from msg.sender (House or Options).
     function notifyRevenue(uint256 amount) external {
-        require(msg.sender == house, "not house");
-        require(usdc.transferFrom(house, address(this), amount), "house pay");
+        require(msg.sender == house || pusher[msg.sender], "not house");
+        require(usdc.transferFrom(msg.sender, address(this), amount), "pay in");
         if (totalStaked > 0) {
             rewardIndex += amount * 1e18 / totalStaked;
         }
