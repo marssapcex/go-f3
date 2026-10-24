@@ -86,7 +86,7 @@ async function algos() {
     const m3 = offerMultiplier(10, 0.001, 60);
     ok(Math.abs(m3.pBust - bustProb(10, 0.001, 60)) < 1e-12 && m3.pBust < 0.02,
         "low leverage rarely busts");
-    ok(Math.abs(m1.mOffer - m1.mFair * 0.98) < 1e-12, "ρ=2% haircut applied");
+    ok(Math.abs(m1.mOffer - m1.mFair * 0.9601) < 1e-12, "ρ=3.99% haircut applied");
     ok(clampMultiplier(0.5) === null && clampMultiplier(30) === 25 && clampMultiplier(5) === 5,
         "on-chain envelope clamp");
   }
@@ -157,12 +157,53 @@ async function interop() {
     const b = await provider.getBlock("latest"); if (b.timestamp >= now + 75) break;
     await new Promise((r2) => setTimeout(r2, 20)); }
   await (await opts.connect(relayer).settleWithPrice(0n, closeX, sigs, { gasLimit: 500_000 })).wait();
-  // v2 queue semantics: premium(100) is house income → pool; net claim 294 > pool
-  // → pool pays 100 immediately, 194 queues FIFO.
+  // Pool=100 premium; gross payout=300 at the band edge; fee=3.99% of gross.
+  const grossOpt = U(300), feeOpt = grossOpt * 399n / 10_000n, netOpt = grossOpt - feeOpt;
   ok((await usdc.balanceOf(b1.address)) === before + U(100),
       "engine-attested settle: pool-covered slice paid instantly");
-  ok((await opts.queueDebt()) === U(194), "rest queued FIFO — pool=0 playable");
+  ok((await opts.queueDebt()) === netOpt - U(100), "rest queued FIFO at 3.99% fee — pool=0 playable");
   ok(await opts.lanesIntact(), "options lanes intact");
+
+  // --- Options fee stream: 3.99% total = 0.99% founder + 3.00% stakers.
+  const feeDiamond = await (await C("DiamondToken", owner).deploy()).waitForDeployment();
+  const feeSink = await (await C("RevenueSplit", owner).deploy(
+    await usdc.getAddress(), await feeDiamond.getAddress())).waitForDeployment();
+  const feeSinkAddr = await feeSink.getAddress();
+  await (await feeDiamond.setMinter(owner.address)).wait();
+  await (await feeDiamond.mint(b3.address, 1_000n * 10n ** 18n)).wait();
+  await (await feeDiamond.setTransferAllowlist(feeSinkAddr, true)).wait();
+  await (await feeDiamond.connect(b3).approve(feeSinkAddr, ethers.MaxUint256)).wait();
+  await (await feeSink.connect(b3).stake(1_000n * 10n ** 18n)).wait();
+  await (await opts.setRevenueSink(feeSinkAddr)).wait();
+  await (await feeSink.setPusher(optAddr, true)).wait(); // Options uses the pusher allowlist
+  await (await opts.setFounderWallet(lp1.address)).wait();
+
+  const now2 = Number((await provider.getBlock("latest")).timestamp);
+  const qLose = await Q.signOption({ classId: 0, dir: 0, premium: U(1_000), multX1e4: x(3),
+    bandBps: 50, strikeX1e8: K, validUntil: now2 + 20, salt: ethers.randomBytes(32), buyer: b3.address });
+  await (await opts.connect(b3).buyOption(qLose.q, qLose.sig, K, 60)).wait(); // id 1
+  const qWin = await Q.signOption({ classId: 0, dir: 0, premium: U(100), multX1e4: x(3),
+    bandBps: 50, strikeX1e8: K, validUntil: now2 + 20, salt: ethers.randomBytes(32), buyer: b2.address });
+  await (await opts.connect(b2).buyOption(qWin.q, qWin.sig, K, 60)).wait();   // id 2
+  await provider.send("evm_increaseTime", [75]);
+  for (let i = 0; i < 60; i++) { await provider.send("evm_mine", []); }
+  // Losing CALL at strike adds 1,000 premium to pool and clears the old FIFO debt inline.
+  await (await opts.connect(relayer).settleWithPrice(1n, K,
+    [await A1.signOptPrice(1n, K), await A2.signOptPrice(1n, K)], { gasLimit: 500_000 })).wait();
+  ok((await opts.queueDebt()) === 0n, "losing option funds pool and clears prior FIFO debt");
+  const founder0 = await usdc.balanceOf(lp1.address), sink0 = await usdc.balanceOf(feeSinkAddr);
+  const winRc = await (await opts.connect(relayer).settleWithPrice(2n, closeX,
+    [await A1.signOptPrice(2n, closeX), await A2.signOptPrice(2n, closeX)], { gasLimit: 500_000 })).wait();
+  const feeEvent = winRc.logs.find((l) => l.fragment?.name === "FeeStreamed");
+  const founderExpected = grossOpt * 99n / 10_000n, stakerExpected = feeOpt - founderExpected;
+  ok(!!feeEvent && feeEvent.args[1] === founderExpected && feeEvent.args[2] === stakerExpected,
+      "Options FeeStreamed splits 0.99% founder / 3.00% stakers");
+  ok((await usdc.balanceOf(lp1.address)) - founder0 === founderExpected,
+      "Options founder receives exactly 0.99% of gross payout");
+  ok((await usdc.balanceOf(feeSinkAddr)) - sink0 === stakerExpected &&
+     (await feeSink.claimable(b3.address)) === stakerExpected,
+      "Options staker slice is pull-based and claimable");
+  ok(await opts.lanesIntact(), "Options lanes intact after fee stream");
 
   // --- G8 two-venue: agree signs, disagree refuses (no signature produced)
   const agr = agreePrice(78.391, 78.392);

@@ -21,8 +21,16 @@ No QMAX brake, no side bucket, no pause switch — a public FIFO queue plus clai
 `queueDebt` is a public liability ledger — never part of B, never hidden:
 winners read their position + owed amount per ticket; total debt is a broadcast.
 
-**Fee honesty:** ρ=2% is a haircut on the claim, recorded in `Settled` events for the mint anchor;
-it never pretends to be in-contract cash. Options book premium income only.
+**Winning-trade fee:** ρ=**3.99%** — 0.99% of the House profit (or Options gross payout) goes to
+`founderWallet`, and the remaining 3.00% goes to `RevenueSplit` for DIAMOND stakers. The owner can
+set the founder later with `setFounderWallet(address)` on both engines; while it is `address(0)`, its
+slice folds into the active staker sink. Integer-rounding dust goes to stakers.
+
+**Fee honesty / cash gating:** fee streams only on a fully cash-paid win, never on a queued or partial
+claim. After paying net, the pool must also cover the outgoing stream; otherwise the unstreamable amount
+stays pooled. If nobody is staking, the staker slice stays pooled rather than becoming stranded in the sink.
+`Settled` / `OSettled` still records the full `feeTaken` haircut for the mint anchor, independently of the
+stream. `FeeStreamed` records actual founder/staker transfers. Options books premium income only.
 
 **Anti-sybil farm bound:** hedged multi-account long/short pairs mint at most `rate × the fees they
 burned themselves` — the anchor counts only realized fees+edge.
@@ -38,14 +46,14 @@ adaptive-rate mirror of the distributor).
 ```bash
 npm install    # ethers@6, ganache, solc 0.8.26 (pinned)
 node compile.js
-node test/diamond.test.js   # 106 contract assertions
-node test/engine.test.js    # 45 engine assertions incl. ganache interop
+node test/diamond.test.js   # 127 contract assertions incl. fee split + cash boundaries
+node test/engine.test.js    # 50 engine assertions incl. Options fee-stream interop
 SEED=1337 node test/fuzz.js # mirror-lane property fuzz (150 ops; seeds 7/42/90210/555 green)
 ```
 
 Fuzz invariants: G1 exact lane mirrors, G2 `lanesIntact()`, G3 no cut-in-line + pay splits,
 G4 FIFO ordering (partial continuation legal), G5 sales never blocked by debt, G6 distribute only
-when queue-clean.
+when queue-clean, G7 founder/staker fee streams exactly mirror balances and pool debits.
 
 Known test-env notes: after heavy ganache evm warp storms ethers' implicit `eth_estimateGas` can read
 a stale pending state — pass explicit `gasLimit` on the affected call (documented inline).
@@ -59,8 +67,9 @@ RPC=http://127.0.0.1:8545 node scripts/deploy.js                                
 ```
 
 Seeds 10 accounts × 1M mock-USDC, 100k LP pool, the full 7-class menu, quoter/attester keys
-(HD path indices 21/31-33 of the ganache mnemonic). **Demo chain only — deterministic mnemonic,
-never send real funds.**
+(HD path indices 21/31-33 of the ganache mnemonic), plus 100k demo DIAMOND to the owner with 10k staked
+so both fee lanes are immediately testable. House and Options share RevenueSplit; founder starts unset.
+**Demo chain only — deterministic mnemonic, never send real funds.**
 
 ## Docs
 
