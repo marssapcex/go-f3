@@ -111,7 +111,7 @@ st_title  = ParagraphStyle("t",  fontName=SERB, fontSize=20, leading=25, alignme
 st_sub    = ParagraphStyle("s",  fontName=SERI, fontSize=12.5, leading=16, alignment=TA_CENTER, spaceAfter=10)
 st_auth   = ParagraphStyle("a",  fontName=SER,  fontSize=10, leading=14, alignment=TA_CENTER, textColor=colors.HexColor("#333"))
 st_abshead= ParagraphStyle("ah", fontName=SERB, fontSize=10.5, leading=13, alignment=TA_CENTER, spaceBefore=8, spaceAfter=4)
-st_abs    = ParagraphStyle("ab", fontName=SER,  fontSize=9.5, leading=13.2, alignment=TA_JUSTIFY, leftIndent=14*mm, rightIndent=14*mm)
+st_abs    = ParagraphStyle("ab", fontName=SER,  fontSize=9.5, leading=12.8, alignment=TA_JUSTIFY, leftIndent=14*mm, rightIndent=14*mm)
 st_h1     = ParagraphStyle("h1", fontName=SERB, fontSize=13, leading=16, spaceBefore=14, spaceAfter=6)
 st_h2     = ParagraphStyle("h2", fontName=SERB, fontSize=11, leading=14, spaceBefore=10, spaceAfter=4)
 st_body   = ParagraphStyle("b",  fontName=SER,  fontSize=9.8, leading=13.6, alignment=TA_JUSTIFY, spaceAfter=5)
@@ -161,7 +161,7 @@ def table(rows, widths, header=True, style_extra=None, fs=8.4):
 E = []  # story
 
 # ---------- title page ----------
-E += [Spacer(1, 26*mm),
+E += [Spacer(1, 20*mm),
       P("DiamondTrading: Transparent-Queue Turbo Markets", st_title),
       P("A Public FIFO Payout Queue with Claim-Level Transparency, Manipulation-Cost Position Caps,<br/>and Counter-Cyclical Anchored Loss-Mint Tokenomics for 1000x Leveraged Wagering", st_sub),
       Spacer(1, 8*mm),
@@ -185,11 +185,11 @@ E += [Spacer(1, 26*mm),
         "measurement-driven quoting engine: deepest-venue routing, VWAP-of-real-fills settlement "
         "anchors, manipulation-cost caps κλω/ω̃ with no treasury terms (§6). <b>Layer three</b> is "
         "the counter-cyclical anchored mint: DIAMOND emission starts at 200% of the signed "
-        "fees-plus-edge anchor, tightens −250bps/epoch as revenue grows (sustained success siết "
+        "realized-net-revenue anchor, tightens −250bps/epoch as revenue grows (sustained success siết "
         "emission), and re-eases +1000bps/epoch when revenue weakens — capped at 200%, floored at "
         "30%, absolutely epoch-capped (§7). The system is implemented — both payout engines, "
-        "verifiers, tokenomics, and the off-chain engine — with 127 contract assertions, 50 engine "
-        "assertions, and five fuzz seeds mirroring every money lane after every operation (§11). "
+        "verifiers, tokenomics, and the off-chain engine — with 130 contract assertions, 51 engine "
+        "assertions, 43 security regressions, and five fuzz seeds mirroring every money lane after every operation (§11). "
         "We state the unbounded-debt risk, the attester-quorum trust assumption, and the licensing "
         "constraint frankly (§12).", st_abs),
       Spacer(1, 6*mm),
@@ -240,8 +240,8 @@ E += [KeepTogether([P("3 &nbsp; Actors, assets, trust", st_h1),
 table([
  ["actor", "role", "what they can and cannot do [COMPUTED: contract code 5]"],
  ["player", "posts margin, receives tickets", "stake back instantly on any correct claim; profit paid now or via FIFO queue; claimInfo says exactly where they stand; 24h stall ⇒ permissionless stake refund; nothing can pause sales"],
- ["LP", "pool capital backing payouts", "first-loss by construction (pool pays before any queue forms, proven in tests); ≥60% of realized revenue once the seeding target is met [5]"],
- ["quoter", "off-chain pricing engine", "signs quotes (σ-priced, κλω-capped, 30s TTL); cannot settle or move funds; worst-case = bad menus bounded by on-chain class clamps"],
+ ["LP", "pool capital backing payouts", "first-loss by construction (pool pays before any queue forms); residual pool NAV after the exit lock; no separate LP revenue floor [5]"],
+ ["quoter", "off-chain pricing engine", "signs one-use quotes (σ-priced, κλω-capped, ≤30s quote validity + signed position TTL); cannot settle or move funds; worst-case = bad menus bounded by on-chain class clamps"],
  ["attester set (2-of-3)", "price persistence verification", "cannot settle alone; cannot forge (2 keys); stall ⇒ permissionless stake refund; threshold floored at 2 on-chain"],
  ["budgetAttester", "revenue anchor for the mint budget", "can only lower emissions; cannot touch principal; bonded, rotating"],
  ["owner (governance)", "config + per-class (enabled, maxMult, profitCap)", "global envelope 1.05x–1000x fixed on-chain; production path = Safe 2-of-3 + 7-day timelock [5]"],
@@ -256,13 +256,14 @@ fig("f5_arch", 150, "Figure 1 — System map: players post USDC; the quoter pric
 
 # ---------- 4 reserve ----------
 E += [P("4 &nbsp; The transparent FIFO payout engine", st_h1),
-P("Let B be the contract's USDC balance. Two cash lanes partition it: <i>pool</i> (house money: fed by "
-  "loser stakes, premiums, and LP deposits) and <i>open</i> (sum of live stakes, fully player-owned). "
+P("Let B be the contract's USDC balance. Three accounted lanes partition obligations: <i>pool</i> (house money: fed by "
+  "loser stakes, premiums, and LP deposits), <i>open</i> (sum of live stakes, fully player-owned), and "
+  "<i>credits</i> (payouts refused by the token, withdrawable later). Donations are unallocated surplus. "
   "The liability side is <i>debt</i> — the sum of queued, unpaid profits. Debt is NOT cash: it is the "
   "house's public obligation, tracked to the wei. At every block:"),
-P("<i>B = pool + open</i>, &nbsp;&nbsp; <i>debt = Σ unpaid queued entries ≥ 0</i>", st_eq),
+P("<i>B ≥ pool + open + credits</i>, &nbsp;&nbsp; <i>debt = Σ unpaid queued entries ≥ 0</i>", st_eq),
 P("Each lane is a first-class storage variable, never derived; <i>lanesIntact()</i> re-verifies the "
-  "identity after every settlement and every treasury send [5]. v0.3 has NO hidden accounting "
+  "solvency inequality after every settlement and every treasury send [5]. v0.3 has NO hidden accounting "
   "surfaces: v0.2's side bucket (a second custody lane that answered &ldquo;where do loser funds sit "
   "while the queue waits&rdquo;) is deleted — loser money lands in the pool, and the pool pays the "
   "line. If the queue outruns the pool, every waiting claimant can see it happen."),
@@ -299,11 +300,11 @@ P("<b>Winning-trade fee split.</b> ρ=3.99%: 0.99% of House profit (or Options g
   "to <i>founderWallet</i>, and the remaining 3.00% streams to RevenueSplit for DIAMOND stakers. "
   "The owner sets the founder address later on both engines; while it is zero, that slice folds into "
   "the active staker sink. Rounding dust goes to stakers [5]."),
-P("<b>Honest accounting and cash gate.</b> The full ρ haircut is recorded in Settled/OSettled for the "
-  "mint anchor, but actual cash streaming is narrower: a queued or partially paid claim streams zero; "
+P("<b>Honest accounting and cash gate.</b> The full ρ haircut is recorded in Settled/OSettled for accounting; the epoch anchor uses stake−payout "
+  "so fees count exactly once. Actual cash streaming is narrower: a queued or partially paid claim streams zero; "
   "a fully paid claim streams only if the post-payout pool covers the outgoing amount. Otherwise the "
   "unstreamable amount stays pooled. With no active stakers, their slice also stays pooled instead of "
-  "becoming stranded in RevenueSplit. FeeStreamed is the actual-transfer receipt. The Options engine "
+  "becoming stranded in RevenueSplit. FeeStreamed records committed amounts; token-refused transfers become credits. The Options engine "
   "books <i>premium only</i> as house income; the unpaid slice of maxPay is a queue-bound liability "
   "haircut, not revenue [5].")]
 
@@ -383,20 +384,20 @@ table([
  ["defense", "rule", "consequence"],
  ["net-loss epochs", "weight base = max(0, Σstake − Σpayout) per address per 6h epoch", "win-then-lose cycles cannot manufacture mintable losses"],
  ["fee-squared weight", "w = √(netLoss · feesPaid) × loyalty (1.25 if staked DIAMOND)", "mint requires real rake; √ forces 4× capital for 2× weight"],
- ["honest anchor", "anchor = Σ fees(user-haircuts) + Σ realized edge, signed by budgetAttester (USDC 1e6)", "budget uses the settled haircut+edge ledger, not projections; hedged sybil pairs mint at most rate× their own fees — the farm is arithmetically bounded [5]"],
+ ["honest anchor", "anchor = max(0, Σstake − Σfee-net payout), signed by budgetAttester (USDC 1e6)", "budget counts realized net revenue once, not projections; the 200% launch rate is an explicit subsidy, not a below-cost farming guarantee [5]"],
  ["launch bait", "rate boots at 200% of anchor, absolute epoch cap on top", "early users are paid like early users"],
  ["growth siết", "anchor &gt; prevAnchor ⇒ rate −250bps/epoch, floor 30%", "sustained revenue tightens emission automatically — success, not a vote, is what siết"],
  ["weakness nới", "anchor &lt; prevAnchor ⇒ rate +1000bps/epoch, ceiling 200%", "shrinking revenue re-opens the tap, fast, to win flow back [COMPUTED]"],
  ["hard ceiling", "mint ≤ epochCap per epoch (default 2M DIAMOND, ≤5M ceiling, lowerable, never raisable)", "sybils split a fixed pie; pro-rata yields no scale [COMPUTED]"],
 ], [26, 78, 66]),
 P("The merkle distributor enforces the adaptive schedule on-chain against the signed anchor — EIP-191 "
-  "over (epochId, anchor, priceX1e8). Price p(e) has no on-chain reference until DIAMOND transfers "
+  "over (chainId, distributor, epochId, anchor, priceX1e8), with aggregate epoch claims capped on-chain. Price p(e) has no on-chain reference until DIAMOND transfers "
   "open, so the attester signs it (bootstrap p(e) ≈ $0.01; TWAP-chained after). Anchors signed under "
   "a wrong domain are rejected by the on-chain identity probe [5]. DiamondToken itself boots "
   "non-transferable (allowlist-only protocol moves); public transfer is a one-way flag flipped after "
   "launch liquidity criteria, never re-lockable [5]. Weights come from the engine ledger [6]; "
   "root/post/claim is covered end to end (§11). DIAMOND carries cashflow via RevenueSplit (pull-only "
-  "notifyRevenue; cumulative-index snapshots), which is what makes an asset handed out on losses worth "
+  "notifyRevenue; seven-day streams with cumulative-index snapshots), which is what makes an asset handed out on losses worth "
   "holding rather than dumping. Its cashflow now includes the direct 3.00% winning-claim stream "
   "(plus the founder slice while that address is unset), subject to §4's cash and active-staking gates."),
 fig("f4_weights", 128, "Figure 5 — Iso-weight curves of w=√(loss·fees): weight grows sub-linearly in both inputs, so scale buys nothing and only sustained, rake-paying participation accumulates emission share."),
@@ -419,16 +420,21 @@ P("9 &nbsp; Security analysis", st_h1),
 P("Method: replay the audit taxonomy of record [2] and ask for each class whether it exists here."),
 table([
  ["exploit class (Guardian id)", "their habitat", "status here", "mechanism"],
- ["payout queue accounting / hidden debt (H-01..M-05)", "queue vs ledger divergence", "contained", "single custody lane; lanesIntact() after every mutation; debt is a public per-claim read (claimInfo)"],
+ ["payout queue accounting / hidden debt (H-01..M-05)", "queue vs ledger divergence", "contained", "donation-safe cash lanes + pull credits; lanesIntact() solvency; debt is a public per-claim read (claimInfo)"],
  ["BBO-midpoint settlement (KV-01)", "single-source midpoint", "absent", "VWAP persistence G2 + 2-of-3 tolerance; L1Read cross-check is the stated endgame"],
  ["short optionality / straddle (KV-02)", "unpriced option grants", "bounded", "payout shapes closed-form; class clamps on-chain; no free bands"],
  ["unconstrained bet sizing (M-02/05)", "flat caps vs flow", "closed", "G3 κλω/ω̃ dynamic caps + on-chain class profit caps (§6.3)"],
- ["gross-mint / mint accounting (KV-04)", "loss-mint farming", "closed", "net-epoch √-weights + adaptive rate on signed anchor + absolute epoch cap; hedged pairs capped at rate× their own fees (§7)"],
- ["keeper/governance capture (L-04, I-20)", "1-of-2, timelock→0, pause-gating", "closed", "threshold floor 2 on-chain; NO pause switch exists at all; owner can never gate user funds"],
+ ["gross-mint / mint accounting (KV-04)", "loss-mint farming", "bounded", "net-epoch √-weights + domain-bound aggregate budget + absolute cap; 200% launch subsidy is explicit (§7)"],
+ ["keeper/governance capture (L-04, I-20)", "1-of-2, timelock→0, pause-gating", "bounded", "attester threshold floor 2; no global pause; owner still rotates critical roles (§12)"],
  ["stale settlement / trapped funds (L-11)", "keeper stall", "closed", "24h permissionless refund; settlement/harvest always live"],
- ["quote replay / intent abuse (KV-14)", "WESig re-use", "closed", "buyer-bound EIP-712 + ≤30s TTL + worst-bounds; wrong-domain sigs rejected (probed)"],
- ["sybil multi-account hedge-mint (new)", "long+short pairs across wallets", "arithmetically bounded", "anchor counts fees+edge, budget ≤ rate× that anchor; pair mints at most rate× its own rake (§7, fuzz-checked)"],
+ ["quote replay / intent abuse (KV-14)", "WESig re-use", "closed", "signed position TTL + one-use digest + buyer/domain binding; original and malleable replays rejected"],
+ ["sybil multi-account hedge-mint (new)", "long+short pairs across wallets", "bounded, not necessarily below cost", "anchor counts stake−fee-net payout once; aggregate budget ≤ rate×anchor; launch subsidy can make farming profitable by design (§7)"],
 ], [42, 38, 24, 66]),
+P("<b>2026-10-24 remediation.</b> Donation-safe lanes, one-use signed-TTL quotes, seven-day reward "
+  "streams, aggregate/domain-bound epoch budgets, exact sink allowances, pull credits, zero-entry "
+  "rejection, and persistent orphan-pool virtual shares with true-empty reset are covered by 43 dedicated regressions [8]. "
+  "The proposed pool−queueDebt LP NAV patch was not applied: queueDebt remains deferred debt, not a "
+  "senior LP reserve; the report PoC withdrew only the later LP's own deposit."),
 P("Residual risks, stated: attester liveness/collusion above floor (mitigated, not eliminated); "
   "κλω is a bound, not a proof of manipulation cost (books can thin faster than flow); equity-perp "
   "single-venue windows degrade G8 to single-read; the quoter's strike/σ inputs are trusted within "
@@ -437,12 +443,12 @@ P("Residual risks, stated: attester liveness/collusion above floor (mitigated, n
 # ---------- 10 econ ----------
 E += [P("10 &nbsp; Economics", st_h1),
 P("Revenue waterfall on realized edge, gated by queue health [5]: distributable = (pool − "
-  "TARGET_POOL) × 80%, computable only when the queue is fully clean (debt = 0 — during a payout "
-  "crisis 100% of flow works the line, none leaks to distributions). Of each distribution: ≥60% goes "
-  "LP-claim pro-rata on a cumulative index (permissionless claimLP — the LP floor is code, not "
-  "policy), the remainder funds the mint anchor + staker rev-share + operations [5][ASSUMED]. LPs "
-  "underwrite variance for the majority share and are provably first-loss: the pool pays winners "
-  "before any queue forms, and exits settle pro-rata against the actual pool [5][6]. The growth loop: "
+  "TARGET_POOL) × 80%, callable only when the queue is fully clean (debt = 0 — during a payout "
+  "crisis 100% of flow works the line, none leaks to distributions). The shipped House sends the "
+  "distribution to RevenueSplit; there is no separate code-enforced claimLP or ≥60% LP floor. LP "
+  "returns instead remain in residual pool NAV, while notified revenue streams to DIAMOND stakers. "
+  "LPs underwrite variance and are first-loss: the pool pays winners before any queue forms, and "
+  "exits settle pro-rata against actual pool cash, not pool−queueDebt [5]. The growth loop: "
   "adaptive mint pays launch-rich rebates while flow proves itself (§7); staker rev-share keeps the "
   "losing-but-loyal cohort invested; ρ=3.99% plus graded ramp wins drive flow; flow deepens LP returns, "
   "shrinks observed debt phases, and the λ-derived caps permit larger honest tickets."),
@@ -455,11 +461,11 @@ P("Fee stance versus incumbents: one headline winning-claim rate, ρ = 3.99%, pu
 P("11 &nbsp; Implementation status and evidence", st_h1),
 table([
  ["component", "artifact", "evidence"],
- ["payout engines", "DiamondHouse v3, DiamondOptions v3 (transparent FIFO) [5]", "127/127 contract assertions green: FIFO ordering, exact-debt partials, inline harvest from pool, no-brake sales under arbitrary debt, absence of any pause switch, stall refunds, EXPIRED rebate timing, claimInfo position/amount reads, exact 0.99/3.00 fee split, founder-unset fallback, no-staker and net-only pool boundaries, lane identity B = pool+open"],
+ ["payout engines", "DiamondHouse v3, DiamondOptions v3 (transparent FIFO) [5]", "130/130 contract assertions green: FIFO ordering, exact-debt partials, inline harvest from pool, no-brake sales under arbitrary debt, absence of any pause switch, stall refunds, EXPIRED rebate timing, claimInfo position/amount reads, exact 0.99/3.00 fee split, founder-unset fallback, no-staker and net-only pool boundaries, lane solvency B ≥ pool+open+credits"],
  ["verifiers", "MultiAttesterVerifier, MultiPriceVerifier [5]", "2-of-3, floor-2, tolerance paths, wrong-domain signature probes"],
- ["tokenomics", "DiamondDistributor (adaptive counter-cyclical rate + anchor EIP-191), RevenueSplit (pull-only notify), DiamondToken (bootstrap lock, one-way enable) [5]", "launch 200%, −250/epoch on growth, +1000/epoch on weakness, floor/ceiling clamps, cap clamp, anchor mis-sign rejected, double-claim blocked, transfer guard + one-way enable tested"],
- ["engine", "engine/ (venues, caps, pricer, quoter, attester, ledger) [6]", "50/50 assertions incl. ganache interop: engine-signed quotes sell, engine attestations settle, engine merkle posts/claims on-chain; caps carry no treasury terms; adaptive-rate mirror and Options fee-stream split verified"],
- ["fuzzing", "property fuzz, 150-op seeds 1337/7/42/90210/555", "157–163 lane/fee checks per seed, all green; debt phases up to $159k exercised; 16–24 FIFO payments per seed; founder/staker balance mirrors green; zero distributions while in debt"],
+ ["tokenomics", "DiamondDistributor (adaptive rate + domain-bound anchor), RevenueSplit (seven-day streams), DiamondToken [5]", "launch 200%, adaptive clamps, aggregate epoch claims, wrong-domain/unset-attester rejection, double-claim block, JIT/multi-staker streaming, transfer guard + one-way enable tested"],
+ ["engine", "engine/ (venues, caps, pricer, quoter, attester, ledger) [6]", "51/51 assertions incl. ganache interop: engine-signed quotes sell, engine attestations settle, engine merkle posts/claims on-chain; caps carry no treasury terms; adaptive-rate mirror and Options fee-stream split verified"],
+ ["security + fuzzing", "test/security.test.js + 150-op seeds 1337/7/42/90210/555 [8]", "43/43 security regressions and all five fuzz seeds green: donations, TTL/replay/malleability, JIT/multi-staker fees, sink allowances, epoch/domain replay, orphan/whale/dust LP attacks and true-empty recap, blocklisted payees, zero entries, deploy guards; lane/fee mirrors green"],
 ], [40, 70, 60]),
 P("12 &nbsp; Limitations (the honest page)", st_h1),
 P("(i) <b>Deferred payment is a real risk by construction, and v0.3 removes the last artificial brake.</b> "
@@ -478,7 +484,11 @@ P("(i) <b>Deferred payment is a real risk by construction, and v0.3 removes the 
   "horizon; licensing (or licensing-grade geofencing) is a launch gate, not a growth item [ASSUMED]. "
   "(viii) Fee cashflow is conditional, not a guaranteed per-win transfer: queued/partial claims and "
   "insufficient post-payout cash do not stream, and the staker slice stays pooled when nobody stakes. "
-  "The founder wallet is a later owner configuration; its zero-address fallback favors active stakers."),
+  "The founder wallet is a later owner configuration; its zero-address fallback favors active stakers. "
+  "(ix) queueDebt is not a senior LP reserve, so LP exits and unpaid winners can coexist; pre-LP orphan "
+  "assets are intentionally locked in virtual shares. (x) Governance remains powerful: no new owner "
+  "timelock is shipped in this patch. (xi) Tests use mock/blocklist-capable tokens on ganache, not real "
+  "USDC or a live deployment; no formal verification or independent audit sign-off is claimed."),
 P("13 &nbsp; References and provenance ledger", st_h1),
 P("[1] [CITED: Martin Galer whitepaper, docs.papertrade.xyz, fetched Oct 2026] queue-based payout "
   "bootstrap, solvency-ratio invariant, loss-emissions.", st_ref),
@@ -493,7 +503,9 @@ P("[5] [COMPUTED: diamondtrading/contracts/ DiamondHouse.sol v3, DiamondOptions.
 P("[6] [COMPUTED: diamondtrading/engine/ + test/engine.test.js + test/fuzz.js — this repository] engine behavior cited above.", st_ref),
 P("[7+] [ASSUMED]/[RECALLED] parameters (κ, ω, ρ, tolerances, splits, curfews, market fee ranges) as "
   "marked inline.", st_ref),
-Spacer(1, 4*mm),
+P("[8] [COMPUTED: diamondtrading/SECURITY.md + test/security.test.js + test/fuzz.js — this repository] "
+  "2026-10-24 finding disposition and dedicated regression evidence.", st_ref),
+PageBreak(),
 P("TÓM TẮT — bản tiếng Việt", st_h1),
 P("DiamondTrading v0.3 là sàn turbo kiểu papertrade (nạp margin, đòn bẩy đến 1000x ở BTC/ETH, biết giá "
   "bust trước khi bấm, thắng thua trong 30–300 giây, thua được mint DIAMOND) được dựng lại từ nền: "
@@ -506,13 +518,13 @@ P("DiamondTrading v0.3 là sàn turbo kiểu papertrade (nạp margin, đòn b�
   "lệnh = min(κλω, cap lớp on-chain); (3) mint khi thua nhưng chống farm: lỗ ròng theo epoch, trọng "
   "số √(lỗ × phí) × hệ số trung thành; ngân sách = rate × doanh thu thật có chữ ký, với rate THÍCH "
   "ỨNG: khởi động 200% (giai đoạn dụ anh em), doanh thu tăng thì siết dần −250bps/epoch về sàn 30%, "
-  "doanh thu sụt thì nới nhanh +1000bps/epoch lên lại trần 200%; không ai chỉnh tay được; (4) kể cả "
-  "bọn nhiều tài khoản hedge long/short để farm cũng chỉ mint tối đa rate× phí chúng tự đốt; (5) phí "
+  "doanh thu sụt thì nới nhanh +1000bps/epoch lên lại trần 200%; không ai chỉnh tay được; (4) "
+  "ngân sách mint chỉ tính stake−payout (payout đã trừ phí) một lần; mức launch 200% là subsidy có chủ đích, không hứa hedge farm luôn lỗ; (5) phí "
   "công khai 3.99% trên lệnh thắng: 0.99% về ví founder (owner thiết lập sau), 3.00% cho staker DIAMOND; "
-  "founder chưa set thì phần đó dồn cho staker đang active; lệnh queue/trả một phần hoặc pool không đủ sau khi trả net thì không stream; chưa có staker thì phần staker ở lại pool; (6) DIAMOND khóa chuyển giao trong bootstrap, mở một chiều "
-  "sau khi đủ thanh khoản, stake DIAMOND được chia doanh thu. Bộ kiểm thử xanh: 127 kiểm chứng hợp "
-  "đồng, 50 kiểm chứng engine, fuzz 5 seed × ~160 bất biến. Rủi ro khai báo thẳng: trả chậm là có thật "
-  "khi queue kẹt (claim không bao giờ mất, chỉ chờ; toàn bộ nợ là số liệu công khai), attester "
+  "founder chưa set thì phần đó dồn cho staker đang active; staker nhận theo stream 7 ngày, không ăn ngay bằng JIT stake; lệnh queue/trả một phần hoặc pool không đủ sau khi trả net thì không stream; chưa có staker thì phần staker ở lại pool; (6) DIAMOND khóa chuyển giao trong bootstrap, mở một chiều "
+  "sau khi đủ thanh khoản, stake DIAMOND được chia doanh thu. Bộ kiểm thử xanh: 130 kiểm chứng hợp "
+  "đồng, 51 kiểm chứng engine, 43 kiểm chứng security, fuzz 5 seed × ~160 bất biến. Rủi ro khai báo thẳng: trả chậm là có thật "
+  "khi queue kẹt (claim vẫn được giữ bằng queue/credit nhưng có thể chờ; queueDebt không phải reserve ưu tiên của LP nên LP rút và winner chờ có thể cùng tồn tại), attester "
   "2-trong-3 vẫn là điểm tin cậy (L1Read cross-check là lộ trình), và điều kiện pháp lý là cổng ra mắt.", st_body)]
 
 doc.build(E)

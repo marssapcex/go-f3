@@ -17,7 +17,7 @@
 //     tune menu config (class caps), never gate user funds.
 //
 // Money-lane invariant (checked in tests after every op):
-//   USDC.balanceOf(this) == pool + openStakes                       (cash lanes)
+//   USDC.balanceOf(this) >= pool + openStakes + totalCredits        (solvency)
 //   queueDebt == Σ queued unpaid profits                            (public liability)
 pragma solidity 0.8.26;
 
@@ -26,6 +26,7 @@ interface IERC20Min {
     function transferFrom(address from, address to, uint256 amount) external returns (bool);
     function balanceOf(address account) external view returns (uint256);
     function approve(address spender, uint256 amount) external returns (bool);
+    function allowance(address owner, address spender) external view returns (uint256);
 }
 interface IOutcomeVerifier {
     function verify(uint256 ticketId, uint8 outcome, bytes[] calldata sigs) external view returns (bool);
@@ -47,6 +48,7 @@ contract DiamondHouse {
         uint64  validUntil;
         bytes32 salt;
         address buyer;
+        uint64  ttl;          // signed duration: the buyer cannot re-price the quote
     }
     struct Ticket {
         address owner;
@@ -73,7 +75,8 @@ contract DiamondHouse {
     IERC20Min public immutable usdc;
     bytes32 public immutable DOMAIN_SEPARATOR;
     bytes32 public constant QUOTE_TYPEHASH = keccak256(
-        "Quote(uint8 classId,uint8 dir,uint128 stake,uint32 multX1e4,uint64 validUntil,bytes32 salt,address buyer)");
+        "Quote(uint8 classId,uint8 dir,uint128 stake,uint32 multX1e4,uint64 validUntil,bytes32 salt,address buyer,uint64 ttl)");
+    uint256 public constant SEND_GAS_FLOOR = 60_000; // prevents gas-starved forced credits
     uint256 public constant BPS = 10_000;
     uint256 public constant FEE_BPS = 399;              // ρ = 3.99% of profit, withheld at settle
     uint256 public constant FOUNDER_FEE_BPS = 99;       //   ↳ 0.99% streamed to founderWallet (settable later)
@@ -93,6 +96,10 @@ contract DiamondHouse {
     address public outcomeVerifier;
     address public revenueSink;
     address public founderWallet;  // 0.99% stream destination; UNSET (0x0) ⇒ that slice goes to stakers too
+
+    mapping(bytes32 => bool) public quoteUsed; // one signed quote = at most one ticket
+    mapping(address => uint256) public credits; // token-refused payouts remain withdrawable
+    uint256 public totalCredits;
 
     uint256 public pool;        // house lane (loses land here directly)
     uint256 public openStakes;  // player lane (unsettled stakes)
@@ -130,6 +137,8 @@ contract DiamondHouse {
     event LpExitRequested(address indexed lp, uint256 shares, uint64 availableAt);
     event LpWithdrawn(address indexed lp, uint256 amount);
     event RevenueDistributed(uint256 amount, address sink);
+    event Credited(address indexed to, uint256 amount);
+    event CreditWithdrawn(address indexed to, uint256 amount);
 
     constructor(address _usdc, address _quoter) {
         require(_usdc != address(0) && _quoter != address(0), "zero addr");
@@ -145,9 +154,10 @@ contract DiamondHouse {
     // ---------------- views ----------------
     function balance() public view returns (uint256) { return usdc.balanceOf(address(this)); }
 
-    /// Cash-lane invariant: every wei in the contract belongs to exactly one lane.
+    /// Solvency invariant: accidental donations are surplus and cannot freeze the book.
+    /// There is deliberately no sweep function; surplus never becomes owner/LP/player funds.
     function lanesIntact() public view returns (bool) {
-        return balance() == pool + openStakes;
+        return balance() >= pool + openStakes + totalCredits;
     }
     function liveQueueEntries() public view returns (uint256) {
         return payoutQueue.length - queueHead;
@@ -178,6 +188,8 @@ contract DiamondHouse {
         require(q.validUntil <= block.timestamp + QUOTE_TTL, "quote too far ahead");
         require(q.multX1e4 >= MIN_MULT_X1E4 && q.multX1e4 <= MAX_MULT_X1E4, "mult clamp");
         require(q.multX1e4 >= minMultX1e4, "slippage: mult");
+        require(q.ttl == ttl, "ttl mismatch");
+        require(q.buyer == msg.sender, "quote not yours");
 
         ClassCfg memory cc = classCfg[q.classId];
         require(cc.enabled, "class disabled");
@@ -185,9 +197,10 @@ contract DiamondHouse {
 
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR,
             keccak256(abi.encode(QUOTE_TYPEHASH, q.classId, q.dir, q.stake,
-                                 q.multX1e4, q.validUntil, q.salt, msg.sender))));
+                                 q.multX1e4, q.validUntil, q.salt, q.buyer, q.ttl))));
         require(_recoverSig(digest, sig) == quoterSigner, "bad quote sig");
-        require(q.buyer == msg.sender, "quote not yours");
+        require(!quoteUsed[digest], "quote used");
+        quoteUsed[digest] = true;
 
         uint256 stake = q.stake;
         uint256 profit = uint256(q.multX1e4 - 10_000) * stake / 10_000; // (M−1)·S
@@ -252,7 +265,7 @@ contract DiamondHouse {
                 profitQueued = netProfit;
             }
             t.queuedProfit = uint128(profitQueued);
-            require(usdc.transfer(t.owner, S + profitPaid), "pay out");
+            _send(t.owner, S + profitPaid);
         } else if (o == Outcome.KNOCKED) {
             pool += S;                 // papertrade rule: loser money feeds the house pot directly
             stakeBack = 0;
@@ -260,7 +273,7 @@ contract DiamondHouse {
             uint256 rebate = S * REBATE_BPS / BPS;
             stakeBack = rebate;
             pool += S - rebate;
-            require(usdc.transfer(t.owner, rebate), "rebate out");
+            _send(t.owner, rebate);
         }
 
         emit Settled(id, uint8(o), stakeBack, profitPaid, profitQueued, feeTaken);
@@ -275,7 +288,7 @@ contract DiamondHouse {
         require(block.timestamp >= t.expiry + STALL_DELAY, "not stalled");
         t.outcome = Outcome.REFUNDED;
         openStakes -= t.stake;
-        require(usdc.transfer(t.owner, t.stake), "refund out");
+        _send(t.owner, t.stake);
         emit Refunded(id, t.stake);
         require(lanesIntact(), "lane drift");
     }
@@ -295,12 +308,39 @@ contract DiamondHouse {
         uint256 total = founderAmt + stakerAmt;
         if (total == 0 || pool < total) return; // no realized cash: retain in pool, never underflow
         pool -= total;
-        if (founderAmt > 0) require(usdc.transfer(founder, founderAmt), "founder out");
-        if (stakerAmt > 0) IRevenueSink(sink).notifyRevenue(stakerAmt);
+        if (founderAmt > 0) _send(founder, founderAmt);
+        if (stakerAmt > 0) {
+            require(usdc.approve(sink, 0), "approve reset");
+            require(usdc.approve(sink, stakerAmt), "approve");
+            IRevenueSink(sink).notifyRevenue(stakerAmt); // pulls exactly stakerAmt
+            require(usdc.allowance(address(this), sink) == 0, "allowance left");
+        }
         emit FeeStreamed(id, founderAmt, stakerAmt);
     }
+    /// A token-level refusal becomes a pull credit instead of freezing unrelated users.
+    function _send(address to, uint256 amount) internal {
+        if (amount == 0) return;
+        require(gasleft() >= SEND_GAS_FLOOR, "send gas");
+        (bool ok, bytes memory ret) = address(usdc).call(
+            abi.encodeWithSelector(IERC20Min.transfer.selector, to, amount));
+        if (ok && (ret.length == 0 || (ret.length == 32 && abi.decode(ret, (bool))))) return;
+        credits[to] += amount;
+        totalCredits += amount;
+        emit Credited(to, amount);
+    }
+
+    function withdrawCredit() external nonReentrant {
+        uint256 amount = credits[msg.sender];
+        require(amount > 0, "no credit");
+        credits[msg.sender] = 0;
+        totalCredits -= amount;
+        require(usdc.transfer(msg.sender, amount), "credit out");
+        emit CreditWithdrawn(msg.sender, amount);
+    }
+
     // ---------------- FIFO payout queue ----------------
     function _enqueue(address who, uint256 amount, uint64 ticketId) internal {
+        if (amount == 0) return;
         payoutQueue.push(QueueEntry({ owner: who, amount: uint128(amount), ticketId: ticketId }));
         queueDebt += amount;
         queueOf[ticketId] = payoutQueue.length; // entryId+1 for claimInfo()
@@ -315,7 +355,7 @@ contract DiamondHouse {
             e.amount -= uint128(pay);
             pool -= pay;
             queueDebt -= pay;
-            require(usdc.transfer(e.owner, pay), "queue out");
+            _send(e.owner, pay);
             emit Dequeued(queueHead, e.owner, pay);
             if (e.amount == 0) queueHead++;
             n--;
@@ -330,10 +370,22 @@ contract DiamondHouse {
     }
 
     // ---------------- LP vault (optional; pool-backed, first-loss) ----------------
+    // ERC-4626-style offsets prevent donation/share inflation. The offset is initialized from
+    // any pool that existed BEFORE the first LP: those orphaned assets belong to non-redeemable
+    // virtual shares, so even a whale depositor cannot capture them. If both pool and real shares
+    // reach zero, no orphan asset remains; reset to the minimal offset so recapitalization is 1:1.
+    // queueDebt remains deferred protocol debt, NOT a senior LP reserve (v3 specification).
+    uint256 public constant LP_SHARE_SCALE = 1e6;
+    uint256 public constant VIRTUAL_ASSETS = 1;
+    uint256 public lpShareOffset; // zero only before the first successful LP deposit
+
     function lpDeposit(uint256 amount) external nonReentrant returns (uint256 shares) {
         require(amount > 0, "zero");
-        if (totalShares == 0 || pool == 0) shares = amount;
-        else shares = amount * totalShares / pool;
+        if (lpShareOffset == 0 || (pool == 0 && totalShares == 0)) {
+            lpShareOffset = (pool == 0 ? 1 : pool) * LP_SHARE_SCALE;
+        }
+        if (pool == 0) shares = amount * LP_SHARE_SCALE;
+        else shares = amount * (totalShares + lpShareOffset) / (pool + VIRTUAL_ASSETS);
         require(shares > 0, "dust");
         require(usdc.transferFrom(msg.sender, address(this), amount), "pay in");
         pool += amount;
@@ -355,12 +407,13 @@ contract DiamondHouse {
         uint256 sh = lpPendingExit[msg.sender];
         require(sh > 0, "nothing");
         require(block.timestamp >= lpExitAvailableAt[msg.sender], "locked");
+        uint256 amount = pool == 0 ? 0 : sh * (pool + VIRTUAL_ASSETS) / (totalShares + lpShareOffset);
+        if (amount > pool) amount = pool;
+        require(amount > 0, "nav empty"); // never burn an exit request for a zero payout
         lpPendingExit[msg.sender] = 0;
         totalShares -= sh;
-        uint256 amount = pool == 0 ? 0 : sh * pool / (totalShares + sh); // NAV slice
-        if (amount > pool) amount = pool;
         pool -= amount;
-        require(usdc.transfer(msg.sender, amount), "lp out");
+        _send(msg.sender, amount);
         emit LpWithdrawn(msg.sender, amount);
         require(lanesIntact(), "lane drift");
     }
@@ -375,9 +428,13 @@ contract DiamondHouse {
 
     function distributeRevenue(uint256 amount) external onlyOwner nonReentrant {
         require(revenueSink != address(0), "no sink");
+        require(IRevenueSink(revenueSink).totalStaked() > 0, "no stakers");
         require(amount > 0 && amount <= distributable(), "nothing/too much");
         pool -= amount;                                   // pre-debit against reentrancy/double-count
-        IRevenueSink(revenueSink).notifyRevenue(amount);  // sink pulls via transferFrom (approved)
+        require(usdc.approve(revenueSink, 0), "approve reset");
+        require(usdc.approve(revenueSink, amount), "approve");
+        IRevenueSink(revenueSink).notifyRevenue(amount);  // pulls exactly amount
+        require(usdc.allowance(address(this), revenueSink) == 0, "allowance left");
         emit RevenueDistributed(amount, revenueSink);
         require(lanesIntact(), "lane drift");
     }
@@ -392,8 +449,10 @@ contract DiamondHouse {
     function setQuoter(address qa) external onlyOwner { require(qa != address(0), "zero"); quoterSigner = qa; emit ParamSet("quoter", uint256(uint160(qa))); }
     function setOutcomeVerifier(address v) external onlyOwner { require(v != address(0), "zero"); outcomeVerifier = v; emit ParamSet("verifier", uint256(uint160(v))); }
     function setRevenueSink(address s) external onlyOwner {
-        revenueSink = s;
-        require(usdc.approve(s, type(uint256).max), "approve");
+        require(s == address(0) || s.code.length > 0, "sink must be contract");
+        address old = revenueSink;
+        if (old != address(0)) require(usdc.approve(old, 0), "revoke");
+        revenueSink = s; // no standing allowance: each notify approves its exact amount
         emit ParamSet("revenueSink", uint256(uint160(s)));
     }
     function setFounderWallet(address f) external onlyOwner { founderWallet = f; emit ParamSet("founderWallet", uint256(uint160(f))); }

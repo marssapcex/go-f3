@@ -2,7 +2,7 @@
 // Mirror-lane design: every successful op updates a JS shadow of ALL money lanes;
 // after EVERY op we assert on-chain == shadow:
 //   G1  pool / openStakes / queueDebt exact mirror, including streamed fees
-//   G2  lanesIntact(): B == pool + open (on-chain view)
+//   G2  lanesIntact(): B >= pool + open + credits (on-chain solvency view)
 //   G3  WON while debt>0 ⇒ full net profit queued (no cut-in-line); else pool pays min(pool,net)
 //   G4  FIFO: Dequeued entry ids strictly increasing (oldest first)
 //   G5  sales NEVER blocked by queue size (v3: no QMAX); only class cap / quote rules bind
@@ -89,7 +89,7 @@ const FEE_BPS = 399n, FOUNDER_FEE_BPS = 99n, BPS = 10_000n;
   const attest = (id, o) => Promise.all([att1, att2].map((a) =>
     a.signTypedData(vDomain, oTypes, { ticketId: id, outcome: o, house: houseAddr })));
   const qDomain = { name: "DiamondHouse", version: "1", chainId: 31337, verifyingContract: houseAddr };
-  const qTypes = { Quote: [ {name:"classId",type:"uint8"},{name:"dir",type:"uint8"},{name:"stake",type:"uint128"},{name:"multX1e4",type:"uint32"},{name:"validUntil",type:"uint64"},{name:"salt",type:"bytes32"},{name:"buyer",type:"address"} ] };
+  const qTypes = { Quote: [ {name:"classId",type:"uint8"},{name:"dir",type:"uint8"},{name:"stake",type:"uint128"},{name:"multX1e4",type:"uint32"},{name:"validUntil",type:"uint64"},{name:"salt",type:"bytes32"},{name:"buyer",type:"address"},{name:"ttl",type:"uint64"} ] };
 
   for (const p of [...players, ...lps]) {
     await (await usdc.connect(owner).mint(p.address, U(500_000))).wait();
@@ -130,7 +130,7 @@ const FEE_BPS = 399n, FOUNDER_FEE_BPS = 99n, BPS = 10_000n;
       : pick([100_000, 250_000, 500_000, 1_000_000, 5_000_000, 10_000_000]); // 75% high-mult → queues
     const ttl = pick(TTLS);
     const q = { classId: 1, dir: ri(0, 1), stake, multX1e4: mult,
-      validUntil: (await now()) + 25, salt: ethers.hexlify(ethers.randomBytes(32)), buyer: buyer.address };
+      validUntil: (await now()) + 25, salt: ethers.hexlify(ethers.randomBytes(32)), buyer: buyer.address, ttl };
     const sig = await quoter.signTypedData(qDomain, qTypes, q);
     const { net } = np(stake, mult);
     const mustFail = (net > U(50_000)); // v3: debt NEVER blocks a sale; class pain cap does

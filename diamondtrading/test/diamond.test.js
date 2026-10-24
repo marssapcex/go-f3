@@ -7,7 +7,7 @@
 //   [FARM] hedged pair caps mint at rate×fees.
 //   [REV]  distribution locked while queue>0 or pool ≤ target; 80% rule; exact pull.
 //   [SETTLE] settle-once, refund/settle double-play, time pins, attester quorum floor.
-// Invariant checked after every mutating call: lanesIntact() == true (B == pool+openStakes).
+// Invariant checked after every mutating call: lanesIntact() == true (B >= pool+openStakes+credits).
 const { ethers } = require("ethers");
 const ganache = require("ganache");
 const fs = require("fs");
@@ -62,9 +62,9 @@ async function main() {
   const now = async () => Number((await provider.getBlock("latest")).timestamp);
   const qTicket = async (buyer, stakeU, mult, over2 = {}) => Q.signTicket({
     classId: 1, dir: 0, stake: U(stakeU), multX1e4: x(mult),
-    validUntil: (await now()) + 25, ...over2, salt: ethers.randomBytes(32), buyer: buyer.address });
+    validUntil: (await now()) + 25, ttl: 60, ...over2, salt: ethers.randomBytes(32), buyer: buyer.address });
   const buyTicket = async (buyer, stakeU, mult, ttl = 60, over2 = {}) => {
-    const r = await qTicket(buyer, stakeU, mult, over2);
+    const r = await qTicket(buyer, stakeU, mult, { ttl, ...over2 });
     const rc = await (await H(buyer).buyTicket(r.q, r.sig, x(mult), ttl)).wait();
     return rc.logs.find((l) => l.fragment?.name === "Sold").args[0];
   };
@@ -105,7 +105,7 @@ async function main() {
     await expectRevert(H(b1).buyTicket(r2v.q, r2v.sig, x(50), 45), "ttl outside set rejected", "bad ttl");
     const r3v = await qTicket(b1, 100, 50);
     // quoter-signed payload over the WRONG domain recovers a wrong signer → rejected
-    const qTypes = { Quote: [ {name:"classId",type:"uint8"},{name:"dir",type:"uint8"},{name:"stake",type:"uint128"},{name:"multX1e4",type:"uint32"},{name:"validUntil",type:"uint64"},{name:"salt",type:"bytes32"},{name:"buyer",type:"address"} ] };
+    const qTypes = { Quote: [ {name:"classId",type:"uint8"},{name:"dir",type:"uint8"},{name:"stake",type:"uint128"},{name:"multX1e4",type:"uint32"},{name:"validUntil",type:"uint64"},{name:"salt",type:"bytes32"},{name:"buyer",type:"address"},{name:"ttl",type:"uint64"} ] };
     const bad = await quoterW.signTypedData(
       { name: "WrongHouse", version: "1", chainId: 31337, verifyingContract: hAddr }, qTypes, r3v.q);
     await expectRevert(H(b1).buyTicket(r3v.q, bad, x(50), 60), "wrong-domain signature rejected", "bad quote sig");
@@ -162,8 +162,8 @@ async function main() {
     const sigh4 = (id, o) => Promise.all([A4a.signOutcome(id, o), A4b.signOutcome(id, o)]);
     const buy4 = async (who, suIn, m, ttl = 60) => {
       const r = await Q4.signTicket({ classId: 1, dir: 0, stake: U(suIn), multX1e4: x(m),
-        validUntil: (await now()) + 25, salt: ethers.randomBytes(32), buyer: who.address });
-      const rc = await (await H4(who).buyTicket(r.q, r.sig, x(m), 60)).wait();
+        validUntil: (await now()) + 25, ttl, salt: ethers.randomBytes(32), buyer: who.address });
+      const rc = await (await H4(who).buyTicket(r.q, r.sig, x(m), ttl)).wait();
       return rc.logs.find((l) => l.fragment?.name === "Sold").args[0];
     };
 
@@ -204,7 +204,7 @@ async function main() {
     ok(ev1 !== undefined, "FeeStreamed emitted on fully-covered win");
     ok(ev1.args[1] === 0n && ev1.args[2] === v1.fee, "founder unset ⇒ whole 3.99% to stakers");
     ok((await usdc.balanceOf(sinkAddr)) === v1.fee, "sink pulled the staker slice (pull-based)");
-    ok((await sink4.claimable(b3.address)) === v1.fee, "staker claimable equals the full 3.99% while founder unset");
+    ok((await sink4.claimable(b3.address)) < U(1), "founder-unset fee starts a 7-day stream, not an instant JIT payout");
     await ok(await h4.lanesIntact(), "lanes after stream-1");
 
     // (2) founder set ⇒ 0.99% founder, 3.00% stakers
@@ -221,10 +221,14 @@ async function main() {
     ok((await usdc.balanceOf(b4.address)) - f0 === fExp, "founder wallet received 0.99% of profit");
     ok((await usdc.balanceOf(sinkAddr)) - s0 === v2.fee - fExp, "stakers received the 3% slice");
     const expectedRewards = v1.fee + v2.fee - fExp;
-    ok((await sink4.claimable(b3.address)) === expectedRewards, "staker claimable accumulates 3.99% + 3.00% exactly");
+    ok((await sink4.claimable(b3.address)) < expectedRewards, "3.99% + 3.00% accrue over time rather than instantly");
+    await warp(7 * 86400 + 60);
+    const accrued = await sink4.claimable(b3.address);
+    ok(accrued <= expectedRewards && accrued + 2n >= expectedRewards, "full accumulated fee is claimable after the stream");
     const stakerUsdc0 = await usdc.balanceOf(b3.address);
-    await (await sink4.connect(b3).claimReward()).wait();
-    ok((await usdc.balanceOf(b3.address)) - stakerUsdc0 === expectedRewards,
+    await (await sink4.connect(b3).claimReward({ gasLimit: 500_000 })).wait();
+    const claimed = (await usdc.balanceOf(b3.address)) - stakerUsdc0;
+    ok(claimed <= expectedRewards && claimed + 2n >= expectedRewards,
        "staker actually claims the streamed USDC rewards");
     ok(v2.fee === v2.p * 399n / 10_000n && v2.fee > v2.p * 200n / 10_000n,
        "ρ is now 3.99% (below recalled competitor 4-6% range)");
@@ -258,7 +262,7 @@ async function main() {
     const sigh2 = (id, o) => Promise.all([A2a.signOutcome(id, o), A2b.signOutcome(id, o)]);
     const buy2 = async (who, suIn, m, ttl = 60) => {
       const r = await Q2.signTicket({ classId: 1, dir: 0, stake: U(suIn), multX1e4: x(m),
-        validUntil: (await now()) + 25, salt: ethers.randomBytes(32), buyer: who.address });
+        validUntil: (await now()) + 25, ttl, salt: ethers.randomBytes(32), buyer: who.address });
       const rc = await (await H2(who).buyTicket(r.q, r.sig, x(m), ttl)).wait();
       return rc.logs.find((l) => l.fragment?.name === "Sold").args[0];
     };
@@ -377,6 +381,7 @@ async function main() {
     const dist = await (await C("DiamondDistributor", owner).deploy(await diamond.getAddress())).waitForDeployment();
     await (await diamond.setMinter(await dist.getAddress())).wait();
     await (await dist.setBudgetAttester(budgeter.address)).wait();
+    const budgetDomain = { chainId: 31337, distributor: await dist.getAddress() };
 
     // adaptive rate (v3): launch 200% bait; growth siết −250/epoch; yếu nới +1000/epoch
     ok(LAUNCH_RATE_BPS === 20000, "launch rate constant 200%");
@@ -397,8 +402,8 @@ async function main() {
     L.add({ owner: b3.address, ts: 30, stake: U(1_000), payout: U(2_100), feePaid: U(30) }); // winner
     L.add({ owner: owner.address, ts: 40, stake: U(9_000), payout: 0n, feePaid: 0n });       // farmer
     const mm = L.mintAmounts(0, { loyaltySet: new Set([b2.address]), priceX1e8: PRICE01 });
-    const expectAnchor = U(120) + (U(13_000) - U(2_600)); // fees 120 + edge (stakeΣ13000 − payΣ2600)
-    ok(mm.anchor === expectAnchor, "anchor = fees + realized edge (not gross losses)");
+    const expectAnchor = U(13_000) - U(2_600); // stakeΣ − payoutΣ; fees already included
+    ok(mm.anchor === expectAnchor, "anchor = realized net revenue with fees counted exactly once");
     // formula path (price high enough that the cap does NOT bind): 200% × anchor ÷ price
     const fchk = L.mintAmounts(0, { loyaltySet: new Set([b2.address]), priceX1e8: 5_000_000n });
     ok(fchk.budget === expectAnchor * 20000n / 10_000n * 10n ** 20n / 5_000_000n,
@@ -416,22 +421,22 @@ async function main() {
     ok(huge.budget === 2_000_000n * 10n ** 18n, "absolute epoch cap binds at 2M DIAMOND");
 
     // on-chain post with correct sig
-    const sig = await signRevenueAnchor(budgeter, 1n, mm.anchor, PRICE01);
+    const sig = await signRevenueAnchor(budgeter, 1n, mm.anchor, PRICE01, budgetDomain);
     const mk = buildMerkle(1, mm.amounts);
     await (await dist.postEpoch(1, mk.root, mm.total, mm.anchor, PRICE01, sig)).wait();
     ok(true, "epoch-1 posts with (anchor, price) attestation");
     ok((await dist.rateBps()) === 20_000n, "rate still 200% after epoch-1 (bait phase intact)");
 
-    // adaptive reaction on-chain: epoch 2 with FEWER fees (weaker anchor)... epoch-1 anchor = 10,520e6
+    // adaptive reaction on-chain: epoch 2 with a weaker realized-revenue anchor
     const weakAnchor = mm.anchor - U(4_000);
-    const weakSig = await signRevenueAnchor(budgeter, 2n, weakAnchor, PRICE01);
+    const weakSig = await signRevenueAnchor(budgeter, 2n, weakAnchor, PRICE01, budgetDomain);
     await (await dist.postEpoch(2, ethers.hexlify(ethers.randomBytes(32)), 0n, weakAnchor, PRICE01, weakSig)).wait();
     ok((await dist.rateBps()) === 20_000n, "weak anchor eases +1000, clamped at the 200% ceiling");
     const bigAnchor = mm.anchor + U(4_000);
-    const bigSig = await signRevenueAnchor(budgeter, 3n, bigAnchor, PRICE01);
+    const bigSig = await signRevenueAnchor(budgeter, 3n, bigAnchor, PRICE01, budgetDomain);
     await (await dist.postEpoch(3, ethers.hexlify(ethers.randomBytes(32)), 0n, bigAnchor, PRICE01, bigSig)).wait();
     ok((await dist.rateBps()) === 19750n, "growth anchor siết −250 → 197.5%");
-    const big2Sig = await signRevenueAnchor(budgeter, 4n, bigAnchor + U(4_000), PRICE01);
+    const big2Sig = await signRevenueAnchor(budgeter, 4n, bigAnchor + U(4_000), PRICE01, budgetDomain);
     await (await dist.postEpoch(4, ethers.hexlify(ethers.randomBytes(32)), 0n, bigAnchor + U(4_000), PRICE01, big2Sig)).wait();
     ok((await dist.rateBps()) === 19500n, "sustained growth grinds −250 more → 195%");
     await expectRevert(dist.postEpoch(2, mk.root, mm.total + 1n, mm.anchor, PRICE01, sig),
@@ -469,7 +474,7 @@ async function main() {
   }
 
   // ============ [FARM] hedged long/short pair ============
-  console.log("\n[FARM] hedge pair: combined mint ≤ rate × fees the pair paid");
+  console.log("\n[FARM] hedge pair: mint capped by rate × realized net revenue");
   {
     const L = new EpochLedger({ epochMs: 6 * 3600 * 1000 });
     // wallet A long: wins big; wallet B short: loses the same notional — net pair P&L ≈ 0
@@ -478,9 +483,9 @@ async function main() {
     const mm = L.mintAmounts(0, { priceX1e8: PRICE01 });
     const pairMint = (mm.amounts.get(b3.address) ?? 0n) + (mm.amounts.get(b4.address) ?? 0n);
     ok(mm.amounts.get(b3.address) === undefined, "hedge winner leg mints zero");
-    ok(mm.budget === (U(400) + U(200)) * 20000n / 10_000n * 10n ** 20n / PRICE01,
-        "budget anchored to fees+edge only: hedgers fund their own ceiling");
-    ok(pairMint <= mm.budget, "pair mint ≤ budget anchored on its own fees+edge");
+    ok(mm.budget === U(200) * 20000n / 10_000n * 10n ** 20n / PRICE01,
+        "budget counts realized net revenue once (not fees twice)");
+    ok(pairMint <= mm.budget, "pair mint ≤ budget anchored on realized net revenue");
     const usdValueOfMint = pairMint * PRICE01 / 10n ** 20n;
     ok(Number(usdValueOfMint) <= Number(mm.anchor) * 2, "mint value ≤ 2× anchor at launch rate 200%");
   }
@@ -502,7 +507,7 @@ async function main() {
     const sigh3 = (id, o) => Promise.all([A3a.signOutcome(id, o), A3b.signOutcome(id, o)]);
     const buy3 = async (who, suIn, m) => {
       const r = await Q3.signTicket({ classId: 1, dir: 0, stake: U(suIn), multX1e4: x(m),
-        validUntil: (await now()) + 25, salt: ethers.randomBytes(32), buyer: who.address });
+        validUntil: (await now()) + 25, ttl: 60, salt: ethers.randomBytes(32), buyer: who.address });
       const rc = await (await H3(who).buyTicket(r.q, r.sig, x(m), 60)).wait();
       return rc.logs.find((l) => l.fragment?.name === "Sold").args[0];
     };
@@ -510,6 +515,12 @@ async function main() {
     const sink3 = await (await C("RevenueSplit", owner).deploy(await usdc.getAddress(), await diamond3.getAddress())).waitForDeployment();
     await (await h3.setRevenueSink(await sink3.getAddress())).wait();
     await (await sink3.setHouse(h3Addr)).wait();
+    await expectRevert(H3(owner).distributeRevenue(U(1)), "no-staker revenue stays in House", "no stakers");
+    await (await diamond3.setMinter(owner.address)).wait();
+    await (await diamond3.mint(b3.address, 1_000n * 10n ** 18n)).wait();
+    await (await diamond3.setTransferAllowlist(await sink3.getAddress(), true)).wait();
+    await (await diamond3.connect(b3).approve(await sink3.getAddress(), ethers.MaxUint256)).wait();
+    await (await sink3.connect(b3).stake(1_000n * 10n ** 18n)).wait();
     await (await h3.setTargetPool(U(500_000))).wait();
 
     // pool 100k << target 500k → nothing distributable
@@ -526,6 +537,7 @@ async function main() {
     const hBal0 = await usdc.balanceOf(h3Addr);
     await (await H3(owner).distributeRevenue(U(80_000))).wait();
     ok(hBal0 - (await usdc.balanceOf(h3Addr)) === U(80_000), "exactly amount leaves house (pull-based)");
+    ok((await usdc.allowance(h3Addr, await sink3.getAddress())) === 0n, "revenue distribution leaves zero standing allowance");
     ok((await h3.pool()) === U(520_000), "pool retained 520k (target + 20% of excess)");
 
     // queue blocks distribution: b2 wins 4.9k@ pool 520k... make a queued win: set QMAX ok but pool < net? pool big enough — instead force queue via losing everything

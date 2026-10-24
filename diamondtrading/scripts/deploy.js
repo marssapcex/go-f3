@@ -1,23 +1,55 @@
 // Demo deployment for user testing: realistic menu + seeded state on local ganache.
-// Run: node scripts/deploy.js  (expects an EVM RPC at $RPC or http://127.0.0.1:8545)
+// Run (demo, local chain only):  DEMO_KEYS=1 node scripts/deploy.js
+// Run (any other chain):         QUOTER_KEY, ATTESTER_KEY_1..3, BUDGETER_KEY must be set (env only)
+// Expects an EVM RPC at $RPC or http://127.0.0.1:8545.
+//
+// F-07 fix: the signing roles are derived from a PUBLIC mnemonic ("test test ... junk").
+// Anyone can derive those keys, so they are only ever used when DEMO_KEYS=1 AND the chain is a
+// local dev chain. Otherwise the script refuses to run (exit code 2) and never falls back to
+// demo keys.
 const { ethers } = require("ethers");
 const fs = require("fs");
 const path = require("path");
+
+const DEMO_MNEMONIC = "test test test test test test test test test test test junk";
+const LOCAL_CHAIN_IDS = new Set([31337, 1337]);   // hardhat/anvil, ganache
+const ENV_KEYS = ["QUOTER_KEY", "ATTESTER_KEY_1", "ATTESTER_KEY_2", "ATTESTER_KEY_3", "BUDGETER_KEY"];
+
+function refuse(msg) {
+  console.error("deploy refused: " + msg);
+  process.exit(2);
+}
+
+/** Resolve the signing roles or refuse. Returns { quoter, att1, att2, att3, budgeter } wallets (unconnected). */
+function resolveKeys(chainId) {
+  if (process.env.DEMO_KEYS === "1") {               // chainId===null ⇒ caller will re-check on-chain
+    if (chainId === null || !LOCAL_CHAIN_IDS.has(chainId)) refuse(`DEMO_KEYS=1 is only allowed on local chains (got chainId ${chainId})`);
+    const hd = (i) => ethers.HDNodeWallet.fromPhrase(DEMO_MNEMONIC, undefined, `m/44'/60'/0'/0/${i}`);
+    return { quoter: hd(21), att1: hd(31), att2: hd(32), att3: hd(33), budgeter: hd(41), demo: true };
+  }
+  const missing = ENV_KEYS.filter((k) => !process.env[k]);
+  if (missing.length) refuse(`no signing keys (missing env: ${missing.join(", ")}); set them or use DEMO_KEYS=1 on a local chain`);
+  const w = (k) => new ethers.Wallet(process.env[k]);
+  return { quoter: w("QUOTER_KEY"), att1: w("ATTESTER_KEY_1"), att2: w("ATTESTER_KEY_2"),
+           att3: w("ATTESTER_KEY_3"), budgeter: w("BUDGETER_KEY"), demo: false };
+}
 
 const art = (n) => JSON.parse(fs.readFileSync(path.join(__dirname, "..", "build", `${n}.json`), "utf8"));
 const U = (n) => BigInt(n) * 10n ** 6n;
 const E18 = (n) => BigInt(n) * 10n ** 18n;
 
 (async () => {
+  // F-07: refuse BEFORE touching the network when no explicit keys and no demo opt-in exist.
+  if (process.env.DEMO_KEYS !== "1") resolveKeys(null);   // env path: missing keys → exit 2
   const rpc = process.env.RPC || "http://127.0.0.1:8545";
   const provider = new ethers.JsonRpcProvider(rpc);
   const chainId = Number((await provider.getNetwork()).chainId);
+  const keys = resolveKeys(chainId);                 // F-07: guard runs before anything is deployed
   const accs = await provider.listAccounts();
   const owner = await provider.getSigner(accs[0].address);
-  const hd = (i) => ethers.HDNodeWallet
-    .fromPhrase("test test test test test test test test test test test junk", undefined, `m/44'/60'/0'/0/${i}`)
-    .connect(provider);
-  const quoter = hd(21), att1 = hd(31), att2 = hd(32), att3 = hd(33), budgeter = hd(41);
+  const conn = (w) => w.connect(provider);
+  const quoter = conn(keys.quoter), att1 = conn(keys.att1), att2 = conn(keys.att2), att3 = conn(keys.att3), budgeter = conn(keys.budgeter);
+  if (keys.demo) console.warn("WARNING: DEMO_KEYS=1 — public test mnemonic signing keys on local chain " + chainId);
 
   const C = (n, s) => new ethers.ContractFactory(art(n).abi, art(n).bytecode, s);
   const usdc = await (await C("MockUSDC", owner).deploy()).waitForDeployment();
@@ -87,7 +119,7 @@ const E18 = (n) => BigInt(n) * 10n ** 18n;
     },
     demoStaking: { mintedToOwner: "100000 DIAMOND", stakedByOwner: "10000 DIAMOND" },
     keys: { quoter: quoter.address, attesters: [att1.address, att2.address, att3.address], budgeter: budgeter.address },
-    note: "demo only — ganache deterministic mnemonic, DO NOT send real funds",
+    note: keys.demo ? "demo only — public deterministic mnemonic, local chain, DO NOT send real funds" : "signing keys supplied via env",
   };
   fs.writeFileSync(path.join(__dirname, "..", "deploy.json"), JSON.stringify(out, null, 2));
   console.log(JSON.stringify(out, null, 2));

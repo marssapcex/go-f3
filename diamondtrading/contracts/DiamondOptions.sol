@@ -16,6 +16,7 @@ interface IERC20MinO {
     function transferFrom(address from, address to, uint256 amount) external returns (bool);
     function balanceOf(address account) external view returns (uint256);
     function approve(address spender, uint256 amount) external returns (bool);
+    function allowance(address owner, address spender) external view returns (uint256);
 }
 interface IPriceVerifier {
     function verifyOpt(uint256 optionId, uint64 closePx, bytes[] calldata sigs) external view returns (bool);
@@ -40,6 +41,7 @@ contract DiamondOptions {
         uint64  validUntil;
         bytes32 salt;
         address buyer;
+        uint64  ttl;            // signed duration, priced by the quoter
     }
     struct Option_ {
         address owner;
@@ -56,6 +58,7 @@ contract DiamondOptions {
     struct QueueEntry { address owner; uint128 amount; uint64 optionId; }
     struct ClassCfg { uint32 maxMultX1e4; uint64 payCap; bool enabled; }
 
+    uint256 public constant SEND_GAS_FLOOR = 60_000;
     uint256 public constant BPS = 10_000;
     uint256 public constant FEE_BPS = 399;             // ρ = 3.99% of payout
     uint256 public constant FOUNDER_FEE_BPS = 99;      // 0.99% → founderWallet (0x0 ⇒ to stakers); 3.00% → stakers
@@ -71,7 +74,7 @@ contract DiamondOptions {
 
     bytes32 public constant OQUOTE_TYPEHASH = keccak256(
         "OQuote(uint8 classId,uint8 dir,uint128 premium,uint32 multX1e4,uint32 bandBps,"
-        "uint64 strikeX1e8,uint64 validUntil,bytes32 salt,address buyer)");
+        "uint64 strikeX1e8,uint64 validUntil,bytes32 salt,address buyer,uint64 ttl)");
 
     IERC20MinO public immutable usdc;
     bytes32 public immutable DOMAIN_SEPARATOR;
@@ -85,6 +88,9 @@ contract DiamondOptions {
     address public revenueSink;
     address public founderWallet;
 
+    mapping(bytes32 => bool) public quoteUsed;
+    mapping(address => uint256) public credits;
+    uint256 public totalCredits;
 
     Option_[]   public options;
     QueueEntry[] public payoutQueue;
@@ -104,6 +110,8 @@ contract DiamondOptions {
     event OQueued(uint256 indexed entryId, uint256 indexed optionId, address owner, uint256 amount);
     event ODequeued(uint256 indexed entryId, address owner, uint256 amount);
     event ParamSet(string what, uint256 value);
+    event Credited(address indexed to, uint256 amount);
+    event CreditWithdrawn(address indexed to, uint256 amount);
 
     constructor(address _usdc, address _quoter) {
         require(_usdc != address(0) && _quoter != address(0), "zero addr");
@@ -117,7 +125,7 @@ contract DiamondOptions {
     }
 
     function lanesIntact() public view returns (bool) {
-        return usdc.balanceOf(address(this)) == pool + openPremiums;
+        return usdc.balanceOf(address(this)) >= pool + openPremiums + totalCredits;
     }
 
     /// queue transparency: position (1 = next to pay) + amount owed; hasDebt=false when clean.
@@ -157,6 +165,8 @@ contract DiamondOptions {
         require(q.multX1e4 >= MIN_MULT_X1E4 && q.multX1e4 <= MAX_MULT_X1E4, "mult clamp");
         require(q.bandBps >= MIN_BAND_BPS && q.bandBps <= MAX_BAND_BPS, "band clamp");
         require(q.strikeX1e8 >= MIN_STRIKE_X1E8, "strike floor");
+        require(q.ttl == ttl, "ttl mismatch");
+        require(q.buyer == msg.sender, "quote not yours");
         // strike slippage guard: buyer pins the worst strike they will accept
         if (q.dir == CALL) require(q.strikeX1e8 <= worstStrikeX1e8, "strike worse");
         else               require(q.strikeX1e8 >= worstStrikeX1e8, "strike worse");
@@ -167,9 +177,10 @@ contract DiamondOptions {
 
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR,
             keccak256(abi.encode(OQUOTE_TYPEHASH, q.classId, q.dir, q.premium, q.multX1e4,
-                                 q.bandBps, q.strikeX1e8, q.validUntil, q.salt, msg.sender))));
+                                 q.bandBps, q.strikeX1e8, q.validUntil, q.salt, q.buyer, q.ttl))));
         require(_recoverSig(digest, sig) == quoterSigner, "bad quote sig");
-        require(q.buyer == msg.sender, "quote not yours");
+        require(!quoteUsed[digest], "quote used");
+        quoteUsed[digest] = true;
 
         uint256 premium = q.premium;
         uint256 maxPay = premium * q.multX1e4 / 10_000;
@@ -219,7 +230,7 @@ contract DiamondOptions {
                 _enqueue(o.owner, net, uint64(id));
             }
             o.queuedPay = uint128(net - paidNow);
-            if (paidNow > 0) require(usdc.transfer(o.owner, paidNow), "pay out");
+            _send(o.owner, paidNow);
         }
 
         emit OSettled(id, closePx, payout, paidNow, net - paidNow, feeTaken);
@@ -242,8 +253,13 @@ contract DiamondOptions {
         uint256 total = founderAmt + stakerAmt;
         if (total == 0 || pool < total) return; // no realized cash: retain in pool, never underflow
         pool -= total;
-        if (founderAmt > 0) require(usdc.transfer(founder, founderAmt), "founder out");
-        if (stakerAmt > 0) IRevenueSinkO(sink).notifyRevenue(stakerAmt);
+        if (founderAmt > 0) _send(founder, founderAmt);
+        if (stakerAmt > 0) {
+            require(usdc.approve(sink, 0), "approve reset");
+            require(usdc.approve(sink, stakerAmt), "approve");
+            IRevenueSinkO(sink).notifyRevenue(stakerAmt); // pulls exactly stakerAmt
+            require(usdc.allowance(address(this), sink) == 0, "allowance left");
+        }
         emit FeeStreamed(id, founderAmt, stakerAmt);
     }
     /// Attester stall > 24h past expiry ⇒ premium back verbatim.
@@ -253,12 +269,34 @@ contract DiamondOptions {
         require(block.timestamp >= o.expiry + STALL_DELAY, "not stalled");
         o.state = 2;
         openPremiums -= o.premium;
-        require(usdc.transfer(o.owner, o.premium), "refund out");
+        _send(o.owner, o.premium);
         emit ORefunded(id, o.premium);
         require(lanesIntact(), "lane drift");
     }
 
+    /// Refused token transfers become pull credits; they cannot hold the FIFO head hostage.
+    function _send(address to, uint256 amount) internal {
+        if (amount == 0) return;
+        require(gasleft() >= SEND_GAS_FLOOR, "send gas");
+        (bool ok, bytes memory ret) = address(usdc).call(
+            abi.encodeWithSelector(IERC20MinO.transfer.selector, to, amount));
+        if (ok && (ret.length == 0 || (ret.length == 32 && abi.decode(ret, (bool))))) return;
+        credits[to] += amount;
+        totalCredits += amount;
+        emit Credited(to, amount);
+    }
+
+    function withdrawCredit() external nonReentrant {
+        uint256 amount = credits[msg.sender];
+        require(amount > 0, "no credit");
+        credits[msg.sender] = 0;
+        totalCredits -= amount;
+        require(usdc.transfer(msg.sender, amount), "credit out");
+        emit CreditWithdrawn(msg.sender, amount);
+    }
+
     function _enqueue(address who, uint256 amount, uint64 optionId) internal {
+        if (amount == 0) return;
         payoutQueue.push(QueueEntry({ owner: who, amount: uint128(amount), optionId: optionId }));
         queueDebt += amount;
         queueOf[optionId] = payoutQueue.length; // entryId+1 for claimInfo()
@@ -272,7 +310,7 @@ contract DiamondOptions {
             e.amount -= uint128(pay);
             pool -= pay;
             queueDebt -= pay;
-            require(usdc.transfer(e.owner, pay), "queue out");
+            _send(e.owner, pay);
             emit ODequeued(queueHead, e.owner, pay);
             if (e.amount == 0) queueHead++;
             n--;
@@ -292,8 +330,10 @@ contract DiamondOptions {
     }
     function setQuoter(address qa) external onlyOwner { require(qa != address(0), "zero"); quoterSigner = qa; emit ParamSet("quoter", uint256(uint160(qa))); }
     function setRevenueSink(address s) external onlyOwner {
-        revenueSink = s;
-        require(usdc.approve(s, type(uint256).max), "approve");
+        require(s == address(0) || s.code.length > 0, "sink must be contract");
+        address old = revenueSink;
+        if (old != address(0)) require(usdc.approve(old, 0), "revoke");
+        revenueSink = s; // exact per-notify allowance only
         emit ParamSet("revenueSink", uint256(uint160(s)));
     }
     function setFounderWallet(address f) external onlyOwner { founderWallet = f; emit ParamSet("founderWallet", uint256(uint160(f))); }

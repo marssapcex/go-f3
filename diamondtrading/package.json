@@ -2,12 +2,13 @@
   "name": "diamondtrading",
   "version": "0.2.0",
   "private": true,
-  "description": "DiamondTrading v2 — queue-bounded turbo markets (pool-zero playable), anti-farm smart mint",
+  "description": "DiamondTrading v3 — transparent-FIFO turbo markets, pool-zero playable, anchored adaptive mint",
   "scripts": {
     "compile": "node compile.js",
-    "test": "node compile.js && node test/diamond.test.js && node test/engine.test.js && SEED=1337 node test/fuzz.js",
+    "test": "node compile.js && node test/diamond.test.js && node test/engine.test.js && node test/security.test.js && SEED=1337 node test/fuzz.js",
     "test:unit": "node test/diamond.test.js",
     "test:engine": "node test/engine.test.js",
+    "test:security": "node test/security.test.js",
     "test:fuzz": "node test/fuzz.js"
   },
   "dependencies": {

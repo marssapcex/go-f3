@@ -1,17 +1,19 @@
 // Quoter: assembles and EIP-712-signs quotes for DiamondHouse (binary tickets) and
 // DiamondOptions (capped-vanilla spreads). Domain/types must mirror the contracts exactly.
+// ttl is signed: buyers cannot substitute a duration the quoter did not price. Quotes are
+// also consumed on-chain after their first successful purchase.
 export const HOUSE_TYPES = { Quote: [
   { name: "classId", type: "uint8" }, { name: "dir", type: "uint8" },
   { name: "stake", type: "uint128" }, { name: "multX1e4", type: "uint32" },
   { name: "validUntil", type: "uint64" }, { name: "salt", type: "bytes32" },
-  { name: "buyer", type: "address" } ] };
+  { name: "buyer", type: "address" }, { name: "ttl", type: "uint64" } ] };
 
 export const OPTIONS_TYPES = { OQuote: [
   { name: "classId", type: "uint8" }, { name: "dir", type: "uint8" },
   { name: "premium", type: "uint128" }, { name: "multX1e4", type: "uint32" },
   { name: "bandBps", type: "uint32" }, { name: "strikeX1e8", type: "uint64" },
   { name: "validUntil", type: "uint64" }, { name: "salt", type: "bytes32" },
-  { name: "buyer", type: "address" } ] };
+  { name: "buyer", type: "address" }, { name: "ttl", type: "uint64" } ] };
 
 export class Quoter {
   constructor(wallet, { houseAddr, optionsAddr, chainId }) {
@@ -21,10 +23,12 @@ export class Quoter {
     if (houseAddr) this.domains.house = { name: "DiamondHouse", version: "1", chainId, verifyingContract: houseAddr };
     if (optionsAddr) this.domains.options = { name: "DiamondOptions", version: "1", chainId, verifyingContract: optionsAddr };
   }
-  async signTicket(value) {   // value: HOUSE_TYPES.Quote fields
+  async signTicket(value) {   // value: HOUSE_TYPES.Quote fields; ttl is mandatory
+    if (value.ttl === undefined) throw new Error("signTicket: ttl is required (signed field)");
     return { q: value, sig: await this.w.signTypedData(this.domains.house, HOUSE_TYPES, value) };
   }
-  async signOption(value) {   // value: OPTIONS_TYPES.OQuote fields
+  async signOption(value) {   // value: OPTIONS_TYPES.OQuote fields; ttl is mandatory
+    if (value.ttl === undefined) throw new Error("signOption: ttl is required (signed field)");
     return { q: value, sig: await this.w.signTypedData(this.domains.options, OPTIONS_TYPES, value) };
   }
 }

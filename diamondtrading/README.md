@@ -5,72 +5,115 @@ prototype lineage, `papertrade/` for the Martin Galer ancestor + Guardian audit)
 **deferred payout exists, is public to the wei, and is never an excuse to stop the machine.**
 No QMAX brake, no side bucket, no pause switch — a public FIFO queue plus claim-level transparency.
 
-## Contracts (Solidity 0.8.26, viaIR, shanghai evm)
+## Contracts (Solidity 0.8.26, viaIR, shanghai EVM)
 
 | contract | role |
 |---|---|
 | `DiamondHouse.sol` | digital tickets 1.05x–1000x (per-class envelope); FIFO queue pays from pool; `claimInfo(ticketId)` → hasDebt / amountOwed / position / totalDebt |
-| `DiamondOptions.sol` | 25x capped-vanilla ramps, same lanes, premium → pool directly |
+| `DiamondOptions.sol` | 25x capped-vanilla ramps, same cash lanes, premium → pool directly |
 | `Verifiers.sol` | MultiAttesterVerifier (2-of-3 EIP-712, floor-2) + MultiPriceVerifier (tolerance cross-check) |
-| `DiamondToken.sol` | DIAMOND: minter-only mint, CAP supply, bootstrap non-transferable (allowlist), one-way `enableTransfers()` |
-| `DiamondDistributor.sol` | merkle claims; **counter-cyclical adaptive rate**: boot 200% of the signed fees+edge anchor, −250bps/epoch while anchor grows (growth siết, floor 30%), +1000bps/epoch while anchor shrinks (weakness nới, ceiling 200%); absolute epoch cap 2M DIAMOND (≤5M ceiling); anchor = EIP-191(epochId, anchorUsd, priceX1e8) |
-| `RevenueSplit.sol` | pull-only `notifyRevenue`, cumulative-index LP ≥60% floor, 7-day unbonding |
-| `MockUSDC.sol` | test token (6 decimals) |
+| `DiamondToken.sol` | DIAMOND: minter-only mint, supply cap, bootstrap non-transferable allowlist, one-way `enableTransfers()` |
+| `DiamondDistributor.sol` | merkle claims; counter-cyclical adaptive rate: 200% launch rate on signed realized net revenue, −250 bps/epoch while the anchor grows (floor 30%), +1000 bps/epoch while it shrinks (ceiling 200%); 2M-DIAMOND epoch cap (≤5M absolute cap) |
+| `RevenueSplit.sol` | pull-only revenue notification, seven-day reward streaming, seven-day unbonding, multi-staker cumulative-index accounting |
+| `MockUSDC.sol` | six-decimal test token; never a production USDC substitute |
 
-**Lanes** (invariant re-asserted after every mutation): `B = pool + openStakes`.
-`queueDebt` is a public liability ledger — never part of B, never hidden:
-winners read their position + owed amount per ticket; total debt is a broadcast.
+### Cash, debt, LP shares, and payout credits
 
-**Winning-trade fee:** ρ=**3.99%** — 0.99% of the House profit (or Options gross payout) goes to
-`founderWallet`, and the remaining 3.00% goes to `RevenueSplit` for DIAMOND stakers. The owner can
-set the founder later with `setFounderWallet(address)` on both engines; while it is `address(0)`, its
-slice folds into the active staker sink. Integer-rounding dust goes to stakers.
+The solvency invariant is `B >= pool + openStakes + totalCredits` for House, and the corresponding
+`openPremiums` lane for Options. Accidental donations are surplus: they cannot make accounting revert,
+and there is deliberately **no `sweepSurplus` function**.
 
-**Fee honesty / cash gating:** fee streams only on a fully cash-paid win, never on a queued or partial
-claim. After paying net, the pool must also cover the outgoing stream; otherwise the unstreamable amount
-stays pooled. If nobody is staking, the staker slice stays pooled rather than becoming stranded in the sink.
-`Settled` / `OSettled` still records the full `feeTaken` haircut for the mint anchor, independently of the
-stream. `FeeStreamed` records actual founder/staker transfers. Options books premium income only.
+`queueDebt` is the public deferred-profit liability. It is not cash and, by explicit v3 product decision,
+it is **not subtracted from LP NAV as a senior reserve**. LP exits remain pro-rata against pool cash after
+the seven-day request lock; queued winners can therefore remain unpaid. `claimInfo` exposes this risk
+rather than hiding it.
 
-**Anti-sybil farm bound:** hedged multi-account long/short pairs mint at most `rate × the fees they
-burned themselves` — the anchor counts only realized fees+edge.
+LP deposits use virtual asset/share offsets against donation-based share inflation. At the first LP
+deposit, any pool that already existed is permanently represented by non-redeemable virtual shares, so
+neither dust nor a whale deposit can capture those orphaned assets. A truly zero pool retains 1:1
+recapitalization pricing. When both pool and real LP shares reach zero, the offset resets to its
+minimum because no orphan asset remains to protect.
+
+If USDC refuses a player/founder/staker transfer (for example, because of a blocklist), House, Options,
+and RevenueSplit preserve the amount as a pull credit instead of letting one payee stall the FIFO or
+other users. Credits are withdrawable after the token accepts the payee again.
+
+### Quotes and epoch claims
+
+House and Options quotes include the priced `ttl` in the EIP-712 payload and are consumed after their
+first successful purchase. Reusing either the original or an ECDSA-malleable signature cannot mint a
+second position.
+
+Distributor budget attestations are EIP-191 signatures over
+`keccak256(abi.encode(chainId, distributor, epochId, anchorUsd, priceX1e8))`. Each epoch also tracks
+`epochClaimed`, so even a tree with individually valid leaves cannot mint more than its posted
+`totalMint` budget. An unset budget attester rejects `postEpoch`.
+
+### Winning-trade fee and revenue streaming
+
+ρ = **3.99%**: 0.99% of House profit (or Options gross payout) goes to `founderWallet`; the remaining
+3.00% goes to RevenueSplit for DIAMOND stakers. While the founder address is zero, its slice folds into
+the active staker sink. Integer-rounding dust goes to stakers.
+
+Fees stream only on a fully cash-paid win, never on a queued or partial claim. After paying net, the
+pool must also cover the outgoing fee; otherwise the unstreamable amount stays pooled. If nobody is
+staking, the staker slice stays pooled rather than becoming stranded in the sink. `Settled` / `OSettled`
+record the full fee haircut; `FeeStreamed` records the committed founder/staker amounts.
+
+RevenueSplit streams received revenue over seven days. A just-in-time staker earns only from its actual
+stake/time share, not an instant retroactive payout. If the last staker exits, an unfinished stream
+pauses and resumes when someone stakes again. House/Options approve only the exact notification amount
+and require a zero allowance afterward; rotating a sink revokes the old allowance.
+
+### Mint anchor — no double count, explicit launch subsidy
+
+The epoch anchor is `max(0, sum(stake) - sum(payout))`. Payout is already fee-net, so adding `feePaid`
+again would double-count revenue. The 200% launch rate remains an intentional incentive: it is not a
+promise that hedged minting is always below cost. Net-loss epochs, square-root weights, per-user claim
+tracking, the aggregate epoch budget, and the absolute cap still bound issuance.
 
 ## Engine (`engine/`)
 
 GALE-style quoter (sigma pricer, κλω/ω̃ manipulation caps with no treasury terms, spike breaker,
-Binance + Hyperliquid routing), epoch ledger (net-loss √-weights ×1e9 BigInt, fee+edge anchor,
-adaptive-rate mirror of the distributor).
+Binance + Hyperliquid routing), epoch ledger (net-loss √-weights ×1e9 BigInt, realized-net-revenue
+anchor, adaptive-rate mirror of the distributor), and domain-required budget-signature helper.
 
-## Tests (all green)
-
-```bash
-npm install    # ethers@6, ganache, solc 0.8.26 (pinned)
-node compile.js
-node test/diamond.test.js   # 127 contract assertions incl. fee split + cash boundaries
-node test/engine.test.js    # 50 engine assertions incl. Options fee-stream interop
-SEED=1337 node test/fuzz.js # mirror-lane property fuzz (150 ops; seeds 7/42/90210/555 green)
-```
-
-Fuzz invariants: G1 exact lane mirrors, G2 `lanesIntact()`, G3 no cut-in-line + pay splits,
-G4 FIFO ordering (partial continuation legal), G5 sales never blocked by debt, G6 distribute only
-when queue-clean, G7 founder/staker fee streams exactly mirror balances and pool debits.
-
-Known test-env notes: after heavy ganache evm warp storms ethers' implicit `eth_estimateGas` can read
-a stale pending state — pass explicit `gasLimit` on the affected call (documented inline).
-solc `evmVersion: shanghai` (cancun emits MCOPY which ganache 7 rejects on constant string getters).
-
-## Demo deploy (MetaMask-checkable)
+## Tests
 
 ```bash
-npx ganache --chain.chainId 31337 --wallet.deterministic -h 0.0.0.0 -p 8545 &   # or the live preview
-RPC=http://127.0.0.1:8545 node scripts/deploy.js                                # writes deploy.json
+npm install
+npm test                    # compile + contract + engine + security + seed-1337 fuzz
+node test/diamond.test.js   # 130 contract assertions
+node test/engine.test.js    # 51 engine assertions
+node test/security.test.js  # 43 audit/security regressions
+SEED=1337 node test/fuzz.js # mirror-lane property fuzz, 150 operations
 ```
 
-Seeds 10 accounts × 1M mock-USDC, 100k LP pool, the full 7-class menu, quoter/attester keys
-(HD path indices 21/31-33 of the ganache mnemonic), plus 100k demo DIAMOND to the owner with 10k staked
-so both fee lanes are immediately testable. House and Options share RevenueSplit; founder starts unset.
-**Demo chain only — deterministic mnemonic, never send real funds.**
+Fuzz invariants cover exact lane mirrors, solvency, FIFO ordering and partial continuation, sales under
+debt, queue-clean distributions, and founder/staker fee mirrors. The security suite additionally covers
+donations, quote TTL/replay/malleability, JIT and multi-staker streaming, sink allowances, epoch/domain
+replay, orphan-pool and whale LP attacks, pool-zero recapitalization, blocklisted payees, zero-value
+queue entries, exact anchor accounting, and deploy-key guards. See `SECURITY.md` for triage decisions
+and residual risks.
+
+Test-environment notes: after heavy ganache time warps, ethers' implicit gas estimation can observe a
+stale pending state; the affected tests use explicit gas limits. solc targets `shanghai` because the
+pinned ganache build rejects cancun/MCOPY bytecode.
+
+## Demo deploy (local chain only)
+
+```bash
+npx ganache --chain.chainId 31337 --wallet.deterministic -h 0.0.0.0 -p 8545
+DEMO_KEYS=1 RPC=http://127.0.0.1:8545 node scripts/deploy.js
+```
+
+The script seeds 10 accounts with mock USDC, a 100k LP pool, the seven-class menu, and demo DIAMOND
+staking. `DEMO_KEYS=1` is required for the public deterministic mnemonic and is refused outside local
+chain IDs 31337/1337. Any other deployment must supply `QUOTER_KEY`, `ATTESTER_KEY_1..3`, and
+`BUDGETER_KEY` through the environment; there is no public-key fallback. Never send real funds to the
+demo deployment or reuse demo signing keys.
 
 ## Docs
 
-`whitepaper/DiamondTrading_v0.3.pdf` (build: `python3 whitepaper/build.py` with reportlab+matplotlib).
+- `SECURITY.md` — audit finding-by-finding decisions, validation, and residual risks.
+- `whitepaper/DiamondTrading_v0.3.pdf` — rebuild with `python3 whitepaper/build.py` (reportlab + matplotlib).

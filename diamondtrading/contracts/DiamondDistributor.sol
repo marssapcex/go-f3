@@ -21,11 +21,12 @@ interface IDiamondToken {
 ///           weakness:      anchorUSD < prevAnchorUsd  ⇒  rateBps += STEP_UP (1000 bps/epoch);
 ///                          shrinking revenue RE-OPENS the tap, aggressively, to win flow back.
 ///
-///         anchorUSD  = off-chain realized fee+edge revenue, signed with the conversion price
-///                      (EIP-191 over (epochId, anchorUSD, priceX1e8)). Emission can never exceed
-///                      a rate-bounded multiple of REAL revenue — hedged long/short farms mint at
-///                      most rateBps× the fees they burned themselves (and multi-account sybils
-///                      only split the same fixed pie).
+///         anchorUSD  = off-chain realized net revenue (stake less player payouts; fees are
+///                      already withheld in those payouts), signed with the conversion price.
+///                      EIP-191 binds chain, contract, epoch, anchor and price. Emission can never exceed
+///                      a rate-bounded multiple of REAL revenue. The 200% launch rate is an
+///                      explicit subsidy, not a claim that hedged farms are always unprofitable;
+///                      multi-account sybils only split the same fixed pie.
 ///         priceX1e8  = internal reference price during bootstrap (attester-signed); TWAP-chained
 ///                      after transfers open. Signed, never free-param.
 ///         An absolute per-epoch token cap (epochCap) bounds any anchor-inflation attempt.
@@ -49,6 +50,7 @@ contract DiamondDistributor {
 
     struct Epoch { bytes32 root; uint256 totalMint; uint64 postedAt; }
     mapping(uint256 => Epoch) public epochs;
+    mapping(uint256 => uint256) public epochClaimed;
     uint256 public lastEpoch;
     mapping(uint256 => mapping(address => bool)) public claimed;
     uint256 public totalMinted;
@@ -98,9 +100,9 @@ contract DiamondDistributor {
         return tokens > epochCap ? epochCap : tokens;
     }
 
-    /// @param anchorUsd realized fee+edge anchor for the epoch (USDC, 6dp).
+    /// @param anchorUsd realized net-revenue anchor for the epoch (USDC, 6dp).
     /// @param priceX1e8 signed conversion price (USDC per DIAMOND ×1e8).
-    /// @param budgetSig EIP-191 personal sign by budgetAttester over (epochId, anchorUsd, priceX1e8).
+    /// @param budgetSig EIP-191 personal sign by budgetAttester over budgetHash(...).
     function postEpoch(
         uint256 epochId,
         bytes32 root,
@@ -109,10 +111,11 @@ contract DiamondDistributor {
         uint256 priceX1e8,
         bytes calldata budgetSig
     ) external onlyOwner {
+        require(budgetAttester != address(0), "no budget attester");
         require(epochId == lastEpoch + 1, "epoch order");
         require(epochs[epochId].root == bytes32(0), "posted");
         bytes32 h = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32",
-                        keccak256(abi.encode(epochId, anchorUsd, priceX1e8))));
+                        budgetHash(epochId, anchorUsd, priceX1e8)));
         require(_rec(h, budgetSig) == budgetAttester, "bad budget sig");
         uint256 budget = budgetFor(anchorUsd, priceX1e8);   // uses projected (adaptive) rate
         require(totalMint <= budget, "over budget");        // rate×anchor AND absolute cap
@@ -131,6 +134,8 @@ contract DiamondDistributor {
         require(!claimed[epochId][msg.sender], "claimed");
         bytes32 leaf = keccak256(bytes.concat(keccak256(abi.encode(epochId, msg.sender, amount))));
         require(_verify(leaf, e.root, proof), "bad proof");
+        require(epochClaimed[epochId] + amount <= e.totalMint, "epoch budget exhausted");
+        epochClaimed[epochId] += amount;
         claimed[epochId][msg.sender] = true;
         totalMinted += amount;
         diamond.mint(msg.sender, amount);
@@ -158,6 +163,11 @@ contract DiamondDistributor {
         if (v < 27) v += 27;
         if (v != 27 && v != 28) return address(0);
         return ecrecover(digest, v, r, s);
+    }
+
+    /// Inner budget hash; callers apply the EIP-191 personal-sign wrap to this value.
+    function budgetHash(uint256 epochId, uint256 anchorUsd, uint256 priceX1e8) public view returns (bytes32) {
+        return keccak256(abi.encode(block.chainid, address(this), epochId, anchorUsd, priceX1e8));
     }
 
     function transferOwnership(address n) external onlyOwner { require(n != address(0), "zero"); owner = n; }
