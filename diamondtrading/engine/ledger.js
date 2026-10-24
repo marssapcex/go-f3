@@ -10,8 +10,10 @@
 // leaf = keccak256(concat(keccak256(abi.encode(epochId, account, amount))))).
 import { ethers } from "ethers";
 
-export const MINT_RATE = { R_MAX_BPS: 20000, R_FLOOR_BPS: 3000, STEP_DOWN_BPS: 250, STEP_UP_BPS: 1000 };
-export const LAUNCH_RATE_BPS = 20000;
+// F-14 fix: ceiling is 100% of REALIZED revenue. 200% let hedged farms mint more than they
+// ever paid the house (the old figures are kept in audit/report as the vulnerable baseline).
+export const MINT_RATE = { R_MAX_BPS: 10000, R_FLOOR_BPS: 3000, STEP_DOWN_BPS: 250, STEP_UP_BPS: 1000 };
+export const LAUNCH_RATE_BPS = 10000;
 
 /** Mirror of DiamondDistributor.projectedRateBps — given the rate stored on-chain and the
  *  previous signed anchor (null on the very first epoch). */
@@ -51,8 +53,10 @@ export class EpochLedger {
       a.fees += r.feePaid; acc.set(r.owner, a);
       stakeSum += r.stake; paySum += r.payout; feeSum += r.feePaid;
     }
-    const edge = stakeSum > paySum ? stakeSum - paySum : 0n;   // realized house edge (incl. fees)
-    const anchor = feeSum + edge;                              // phí thực thu + edge thực hiện
+    // realized house P&L for the epoch. `payout` already has the fee removed, so stake − payout
+    // INCLUDES the fee: the anchor is this number alone (F-14: adding fees again double-counted).
+    const edge = stakeSum > paySum ? stakeSum - paySum : 0n;
+    const anchor = edge;
     return { acc, revenue: edge, fees: feeSum, anchor };
   }
 
@@ -130,9 +134,15 @@ export function buildMerkle(epochId, entries /* Map<address, amount> | [[address
 }
 
 /** budgetAttester signs the revenue anchor + reference price: EIP-191 personal_sign over
- *  keccak256(abi.encode(epochId, anchorUsd, priceX1e8)) — mirror of EdgeDistributor.postEpoch v2. */
-export function signRevenueAnchor(wallet, epochId, anchorUsd, priceX1e8) {
+ *  keccak256(abi.encode(chainId, distributor, epochId, anchorUsd, priceX1e8)) — mirror of
+ *  DiamondDistributor.postEpoch. D2 fix: domain-bound, so a signature cannot be replayed on
+ *  another chain or another distributor deployment. `domain` is REQUIRED. */
+export function signRevenueAnchor(wallet, epochId, anchorUsd, priceX1e8, domain) {
+  if (!domain || domain.chainId === undefined || !domain.distributor) {
+    throw new Error("signRevenueAnchor: domain {chainId, distributor} is required");
+  }
   const h = ethers.keccak256(ethers.AbiCoder.defaultAbiCoder()
-    .encode(["uint256", "uint256", "uint256"], [epochId, anchorUsd, priceX1e8]));
+    .encode(["uint256", "address", "uint256", "uint256", "uint256"],
+            [domain.chainId, domain.distributor, epochId, anchorUsd, priceX1e8]));
   return wallet.signMessage(ethers.getBytes(h));
 }

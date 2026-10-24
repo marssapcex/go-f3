@@ -1,0 +1,31 @@
+
+
+  F-06 LP exit subordinates the queue [set=vulnerable]
+  [EVIDENCE] queueDebt after 5 wins with empty pool = 480050000 (6dp), pool = 0
+  [EVIDENCE] after LP deposit 100: pool=100000000, queueDebt=480050000
+  [EVIDENCE] lpWithdraw → OK, LP received 100 USDC
+  [EVIDENCE] remaining queueDebt owed to winners = 480050000 (6dp), pool = 0
+    ✔ LP withdraws its 100 USDC while winners' profit is still owed (879ms)
+
+  F-07 public deployment keys [set=vulnerable]
+  [EVIDENCE] quoter  (HD21) = 0x02484cb50AAC86Eae85610D6f4Bf026f30f6627D
+  [EVIDENCE] attester(HD31) = 0x8263Fce86B1b78F95Ab4dae11907d8AF88f841e7, attester(HD32) = 0xcF2d5b3cBb4D7bF04e3F7bFa8e27081B52191f91  (2-of-3 quorum)
+  [EVIDENCE] derivation phrase = "test test ... test junk" (public ganache/hardhat mnemonic)
+  [EVIDENCE] house.quoterSigner == derived HD21? true
+  [EVIDENCE] WON attested with derived attester keys → OK; attacker received 48044.9 USDC from pool (pool before=100000000000)
+    ✔ PoC (vulnerable): anyone holding the public mnemonic can quote a 50x ticket and attest it WON (129ms)
+    - fixed: deploy.js refuses to run without explicit keys (exit 2, no demo fallback)
+    - fixed: DEMO_KEYS=1 is refused on a non-local chain (public mnemonic never signs on a real network)
+
+  F-08 owner-controlled drain via approvals [set=vulnerable]
+  [EVIDENCE] House holds 102000 USDC (pool 100,000 + open player stake 2,000)
+  [EVIDENCE] owner.setRevenueSink(EOA) → OK
+  [EVIDENCE] EOA.transferFrom(House → EOA, all) → OK; EOA gained 102000 USDC
+  [EVIDENCE] previous sink after rotation: transferFrom(House, 1 USDC) → OK (allowance never revoked)
+    ✔ owner points revenueSink at an EOA: the EOA drains House, including open player stakes (197ms)
+
+
+  3 passing (1s)
+  2 pending
+
+EXIT=0

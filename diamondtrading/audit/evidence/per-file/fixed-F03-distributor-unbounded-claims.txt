@@ -1,0 +1,13 @@
+
+
+  F-03 distributor claims unbounded by budget [set=fixed]
+  [EVIDENCE] signed anchor=$100, price=$0.01 → on-chain budget = 10000.0 DIAMOND
+  [EVIDENCE] postEpoch(totalMint=10000.0 DIAMOND) accepted
+  [EVIDENCE] attacker claim(1,000,000 DIAMOND) → epoch budget exhausted; attacker balance = 0.0 DIAMOND
+  [EVIDENCE] dist.totalMinted = 0.0 DIAMOND vs epoch budget 10000.0
+    ✔ owner posts totalMint=20,000 DIAMOND (within budget) but the root pays attacker 1,000,000 (852ms)
+
+
+  1 passing (855ms)
+
+EXIT=0

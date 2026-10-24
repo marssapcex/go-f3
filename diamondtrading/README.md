@@ -63,11 +63,14 @@ solc `evmVersion: shanghai` (cancun emits MCOPY which ganache 7 rejects on const
 
 ```bash
 npx ganache --chain.chainId 31337 --wallet.deterministic -h 0.0.0.0 -p 8545 &   # or the live preview
-RPC=http://127.0.0.1:8545 node scripts/deploy.js                                # writes deploy.json
+DEMO_KEYS=1 RPC=http://127.0.0.1:8545 node scripts/deploy.js                              # writes deploy.json
+# DEMO_KEYS=1 uses the PUBLIC test mnemonic for the signing roles and is refused on any chain
+# other than 31337/1337. Without it, deploy.js needs QUOTER_KEY, ATTESTER_KEY_1..3, BUDGETER_KEY
+# in the environment and exits with code 2 otherwise (audit F-07).
 ```
 
 Seeds 10 accounts × 1M mock-USDC, 100k LP pool, the full 7-class menu, quoter/attester keys
-(HD path indices 21/31-33 of the ganache mnemonic), plus 100k demo DIAMOND to the owner with 10k staked
+(HD path indices 21/31-33 of the ganache mnemonic; only with DEMO_KEYS=1), plus 100k demo DIAMOND to the owner with 10k staked
 so both fee lanes are immediately testable. House and Options share RevenueSplit; founder starts unset.
 **Demo chain only — deterministic mnemonic, never send real funds.**
 

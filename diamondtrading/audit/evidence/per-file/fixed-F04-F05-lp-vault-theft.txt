@@ -1,0 +1,18 @@
+
+
+  F-04 orphan pool capture [set=fixed]
+  [EVIDENCE] pool after loss = 1000000000 (6dp), totalShares = 0
+  [EVIDENCE] attacker lpDeposit(1 wei) → dust; shares = 0
+    ✔ 1-wei LP deposit into an orphaned pool withdraws the whole pool after the 7-day lock (876ms)
+
+  F-05 LP share inflation [set=fixed]
+  [EVIDENCE] pool after attacker's losing bets = 4999000001 (6dp)
+  [EVIDENCE] victim deposit 2,999 USDC → OK; victim shares=2998999, attacker shares=1000000
+  [EVIDENCE] attacker cost = 2000 USDC (lost bets) + 1 wei, received = 1000.0002 USDC → net -999.999801 USDC
+  [EVIDENCE] victim deposited 2999 USDC, received 2998.999601 USDC → net -0.000399 USDC
+    ✔ attacker (1 share) inflates NAV with losing bets; victim's deposit rounds to 1 share (126ms)
+
+
+  2 passing (1s)
+
+EXIT=0

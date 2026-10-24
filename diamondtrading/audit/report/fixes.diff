@@ -1,0 +1,939 @@
+diff --git a/diamondtrading/README.md b/diamondtrading/README.md
+index e5bf33c..e2cf185 100644
+--- a/diamondtrading/README.md
++++ b/diamondtrading/README.md
+@@ -63,11 +63,14 @@ solc `evmVersion: shanghai` (cancun emits MCOPY which ganache 7 rejects on const
+ 
+ ```bash
+ npx ganache --chain.chainId 31337 --wallet.deterministic -h 0.0.0.0 -p 8545 &   # or the live preview
+-RPC=http://127.0.0.1:8545 node scripts/deploy.js                                # writes deploy.json
++DEMO_KEYS=1 RPC=http://127.0.0.1:8545 node scripts/deploy.js                              # writes deploy.json
++# DEMO_KEYS=1 uses the PUBLIC test mnemonic for the signing roles and is refused on any chain
++# other than 31337/1337. Without it, deploy.js needs QUOTER_KEY, ATTESTER_KEY_1..3, BUDGETER_KEY
++# in the environment and exits with code 2 otherwise (audit F-07).
+ ```
+ 
+ Seeds 10 accounts × 1M mock-USDC, 100k LP pool, the full 7-class menu, quoter/attester keys
+-(HD path indices 21/31-33 of the ganache mnemonic), plus 100k demo DIAMOND to the owner with 10k staked
++(HD path indices 21/31-33 of the ganache mnemonic; only with DEMO_KEYS=1), plus 100k demo DIAMOND to the owner with 10k staked
+ so both fee lanes are immediately testable. House and Options share RevenueSplit; founder starts unset.
+ **Demo chain only — deterministic mnemonic, never send real funds.**
+ 
+diff --git a/diamondtrading/contracts/DiamondDistributor.sol b/diamondtrading/contracts/DiamondDistributor.sol
+index 08839c4..8f8da3a 100644
+--- a/diamondtrading/contracts/DiamondDistributor.sol
++++ b/diamondtrading/contracts/DiamondDistributor.sol
+@@ -29,25 +29,34 @@ interface IDiamondToken {
+ ///         priceX1e8  = internal reference price during bootstrap (attester-signed); TWAP-chained
+ ///                      after transfers open. Signed, never free-param.
+ ///         An absolute per-epoch token cap (epochCap) bounds any anchor-inflation attempt.
++///
++/// AUDIT FIXES (audit/report):
++///  F-14: launch rate is 100% of the REALIZED house revenue (not 200%), and the anchor is the
++///        realized edge only (fees are already inside stake − payout; adding them double-counted).
++///  F-03: total claims against an epoch can never exceed that epoch's posted totalMint, so a
++///        leaked root/owner key cannot mint beyond the budget the attester signed.
++///  F-12b: a budgetAttester must be configured before any epoch can be posted.
++///  D2:   the budget signature is bound to chainid + this contract (no cross-deployment replay).
+ contract DiamondDistributor {
+     IDiamondToken public immutable diamond;
+     address public owner;
+     address public budgetAttester; // bonded off-chain accountant; signs (epoch, anchor, price)
+ 
+     uint256 public constant BPS = 10_000;
+-    uint256 public constant R_MAX_BPS = 20_000;    // 200% launch/bait ceiling
++    uint256 public constant R_MAX_BPS = 10_000;    // 100% ceiling: never mint more than realized revenue (F-14)
+     uint256 public constant R_FLOOR_BPS = 3_000;   // 30% tighten floor
+     uint256 public constant STEP_DOWN_BPS = 250;   // tighten per growth epoch (slow grind)
+     uint256 public constant STEP_UP_BPS = 1_000;   // ease per weak epoch (fast re-bait)
+     uint256 public constant MAX_EPOCH_GAP = 7 days;
+ 
+-    uint256 public rateBps = R_MAX_BPS;     // starts rich (bootstrap)
++    uint256 public rateBps = R_MAX_BPS;     // starts at ceiling (bootstrap)
+     uint256 public prevAnchorUsd;           // last epoch's signed anchor (reaction reference)
+ 
+     uint256 public epochCap = 2_000_000e18;      // absolute per-epoch mint cap (≈0.5% genesis scale)
+     uint256 public constant EPOCH_CAP_CEILING = 5_000_000e18;
+ 
+     struct Epoch { bytes32 root; uint256 totalMint; uint64 postedAt; }
++    mapping(uint256 => uint256) public epochClaimed;   // F-03: running total claimed per epoch
+     mapping(uint256 => Epoch) public epochs;
+     uint256 public lastEpoch;
+     mapping(uint256 => mapping(address => bool)) public claimed;
+@@ -109,10 +118,11 @@ contract DiamondDistributor {
+         uint256 priceX1e8,
+         bytes calldata budgetSig
+     ) external onlyOwner {
++        require(budgetAttester != address(0), "no budget attester");   // F-12b
+         require(epochId == lastEpoch + 1, "epoch order");
+         require(epochs[epochId].root == bytes32(0), "posted");
+         bytes32 h = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32",
+-                        keccak256(abi.encode(epochId, anchorUsd, priceX1e8))));
++                        keccak256(abi.encode(block.chainid, address(this), epochId, anchorUsd, priceX1e8))));
+         require(_rec(h, budgetSig) == budgetAttester, "bad budget sig");
+         uint256 budget = budgetFor(anchorUsd, priceX1e8);   // uses projected (adaptive) rate
+         require(totalMint <= budget, "over budget");        // rate×anchor AND absolute cap
+@@ -131,6 +141,8 @@ contract DiamondDistributor {
+         require(!claimed[epochId][msg.sender], "claimed");
+         bytes32 leaf = keccak256(bytes.concat(keccak256(abi.encode(epochId, msg.sender, amount))));
+         require(_verify(leaf, e.root, proof), "bad proof");
++        require(epochClaimed[epochId] + amount <= e.totalMint, "epoch budget exhausted");  // F-03
++        epochClaimed[epochId] += amount;
+         claimed[epochId][msg.sender] = true;
+         totalMinted += amount;
+         diamond.mint(msg.sender, amount);
+@@ -161,4 +173,9 @@ contract DiamondDistributor {
+     }
+ 
+     function transferOwnership(address n) external onlyOwner { require(n != address(0), "zero"); owner = n; }
++
++    /// Inner budget hash; the signed message is its EIP-191 wrap (engine mirror: signRevenueAnchor).
++    function budgetHash(uint256 epochId, uint256 anchorUsd, uint256 priceX1e8) public view returns (bytes32) {
++        return keccak256(abi.encode(block.chainid, address(this), epochId, anchorUsd, priceX1e8));
++    }
+ }
+diff --git a/diamondtrading/contracts/DiamondHouse.sol b/diamondtrading/contracts/DiamondHouse.sol
+index 843fdd9..506e29a 100644
+--- a/diamondtrading/contracts/DiamondHouse.sol
++++ b/diamondtrading/contracts/DiamondHouse.sol
+@@ -14,7 +14,13 @@
+ //   - distributions to stakers allowed only with an empty queue and only out of the
+ //     slice of pool above TARGET_POOL (launch split 80/20, retained share stays pooled).
+ //   - no pause switch anywhere: fully permissoinless settlement path; owner can only
+-//     tune menu config (class caps), never gate user funds.
++//     tune menu config (class caps, tighten-only once live), never gate user funds.
++//
++// AUDIT FIXES (see audit/report): F-01 solvency (not equality) lane check + owner sweep of
++// donations; F-08 exact per-notify USDC approvals, revoked on sink rotation, timelocked
++// verifier/quoter swaps; F-09 ttl is signed in the quote; F-10 quotes are single-use;
++// F-11 payouts that the token refuses are credited for pull-withdrawal (no head-of-line DoS);
++// F-12 zero-amount queue entries are never created.
+ //
+ // Money-lane invariant (checked in tests after every op):
+ //   USDC.balanceOf(this) == pool + openStakes                       (cash lanes)
+@@ -47,6 +53,7 @@ contract DiamondHouse {
+         uint64  validUntil;
+         bytes32 salt;
+         address buyer;
++        uint64  ttl;          // F-09: buyer's duration is part of the signed quote
+     }
+     struct Ticket {
+         address owner;
+@@ -73,7 +80,9 @@ contract DiamondHouse {
+     IERC20Min public immutable usdc;
+     bytes32 public immutable DOMAIN_SEPARATOR;
+     bytes32 public constant QUOTE_TYPEHASH = keccak256(
+-        "Quote(uint8 classId,uint8 dir,uint128 stake,uint32 multX1e4,uint64 validUntil,bytes32 salt,address buyer)");
++        "Quote(uint8 classId,uint8 dir,uint128 stake,uint32 multX1e4,uint64 validUntil,bytes32 salt,address buyer,uint64 ttl)");
++    uint256 public constant GOV_DELAY = 2 days;  // F-08: verifier / quoter swaps are timelocked
++    uint256 public constant SEND_GAS_FLOOR = 60_000;  // F-11: minimum gas left for a token payout
+     uint256 public constant BPS = 10_000;
+     uint256 public constant FEE_BPS = 399;              // ρ = 3.99% of profit, withheld at settle
+     uint256 public constant FOUNDER_FEE_BPS = 99;       //   ↳ 0.99% streamed to founderWallet (settable later)
+@@ -94,6 +103,16 @@ contract DiamondHouse {
+     address public revenueSink;
+     address public founderWallet;  // 0.99% stream destination; UNSET (0x0) ⇒ that slice goes to stakers too
+ 
++    // F-10: single-use quotes
++    mapping(bytes32 => bool) public quoteUsed;
++    // F-11: payouts refused by the token are credited and pulled later (never stall the queue)
++    mapping(address => uint256) public credits;
++    uint256 public totalCredits;
++    // F-08: timelocked governance for the signing roots
++    struct Pending { address who; uint64 eta; }
++    Pending public pendingQuoter;
++    Pending public pendingVerifier;
++
+     uint256 public pool;        // house lane (loses land here directly)
+     uint256 public openStakes;  // player lane (unsettled stakes)
+     uint256 public queueDebt;   // Σ unpaid queued profits (public debt)
+@@ -130,6 +149,9 @@ contract DiamondHouse {
+     event LpExitRequested(address indexed lp, uint256 shares, uint64 availableAt);
+     event LpWithdrawn(address indexed lp, uint256 amount);
+     event RevenueDistributed(uint256 amount, address sink);
++    event Credited(address indexed to, uint256 amount);
++    event CreditWithdrawn(address indexed to, uint256 amount);
++    event GovProposed(string what, address who, uint64 eta);
+ 
+     constructor(address _usdc, address _quoter) {
+         require(_usdc != address(0) && _quoter != address(0), "zero addr");
+@@ -145,9 +167,21 @@ contract DiamondHouse {
+     // ---------------- views ----------------
+     function balance() public view returns (uint256) { return usdc.balanceOf(address(this)); }
+ 
+-    /// Cash-lane invariant: every wei in the contract belongs to exactly one lane.
++    /// Cash-lane invariant (F-01 fix): the contract must HOLD at least what it owes.
++    /// Surplus (accidental transfers) cannot freeze the protocol; owner may sweep it.
+     function lanesIntact() public view returns (bool) {
+-        return balance() == pool + openStakes;
++        return balance() >= pool + openStakes + totalCredits;
++    }
++    /// NAV available to LPs: queued winners are senior (F-06).
++    function navPool() public view returns (uint256) {
++        return pool > queueDebt ? pool - queueDebt : 0;
++    }
++    /// Sweep of unallocated surplus only (donations); never touches pool / openStakes / credits.
++    function sweepSurplus(address to) external onlyOwner nonReentrant {
++        uint256 b = balance();
++        uint256 owed = pool + openStakes + totalCredits;
++        require(b > owed, "no surplus");
++        require(usdc.transfer(to, b - owed), "sweep out");
+     }
+     function liveQueueEntries() public view returns (uint256) {
+         return payoutQueue.length - queueHead;
+@@ -178,6 +212,7 @@ contract DiamondHouse {
+         require(q.validUntil <= block.timestamp + QUOTE_TTL, "quote too far ahead");
+         require(q.multX1e4 >= MIN_MULT_X1E4 && q.multX1e4 <= MAX_MULT_X1E4, "mult clamp");
+         require(q.multX1e4 >= minMultX1e4, "slippage: mult");
++        require(q.ttl == ttl, "ttl mismatch");                       // F-09
+ 
+         ClassCfg memory cc = classCfg[q.classId];
+         require(cc.enabled, "class disabled");
+@@ -185,9 +220,11 @@ contract DiamondHouse {
+ 
+         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR,
+             keccak256(abi.encode(QUOTE_TYPEHASH, q.classId, q.dir, q.stake,
+-                                 q.multX1e4, q.validUntil, q.salt, msg.sender))));
++                                 q.multX1e4, q.validUntil, q.salt, msg.sender, q.ttl))));
+         require(_recoverSig(digest, sig) == quoterSigner, "bad quote sig");
+         require(q.buyer == msg.sender, "quote not yours");
++        require(!quoteUsed[digest], "quote used");                   // F-10
++        quoteUsed[digest] = true;
+ 
+         uint256 stake = q.stake;
+         uint256 profit = uint256(q.multX1e4 - 10_000) * stake / 10_000; // (M−1)·S
+@@ -252,7 +289,7 @@ contract DiamondHouse {
+                 profitQueued = netProfit;
+             }
+             t.queuedProfit = uint128(profitQueued);
+-            require(usdc.transfer(t.owner, S + profitPaid), "pay out");
++            _send(t.owner, S + profitPaid);
+         } else if (o == Outcome.KNOCKED) {
+             pool += S;                 // papertrade rule: loser money feeds the house pot directly
+             stakeBack = 0;
+@@ -260,7 +297,7 @@ contract DiamondHouse {
+             uint256 rebate = S * REBATE_BPS / BPS;
+             stakeBack = rebate;
+             pool += S - rebate;
+-            require(usdc.transfer(t.owner, rebate), "rebate out");
++            _send(t.owner, rebate);
+         }
+ 
+         emit Settled(id, uint8(o), stakeBack, profitPaid, profitQueued, feeTaken);
+@@ -275,7 +312,7 @@ contract DiamondHouse {
+         require(block.timestamp >= t.expiry + STALL_DELAY, "not stalled");
+         t.outcome = Outcome.REFUNDED;
+         openStakes -= t.stake;
+-        require(usdc.transfer(t.owner, t.stake), "refund out");
++        _send(t.owner, t.stake);
+         emit Refunded(id, t.stake);
+         require(lanesIntact(), "lane drift");
+     }
+@@ -295,12 +332,39 @@ contract DiamondHouse {
+         uint256 total = founderAmt + stakerAmt;
+         if (total == 0 || pool < total) return; // no realized cash: retain in pool, never underflow
+         pool -= total;
+-        if (founderAmt > 0) require(usdc.transfer(founder, founderAmt), "founder out");
+-        if (stakerAmt > 0) IRevenueSink(sink).notifyRevenue(stakerAmt);
++        if (founderAmt > 0) _send(founder, founderAmt);
++        if (stakerAmt > 0) {
++            require(usdc.approve(sink, stakerAmt), "approve");  // F-08: exact, single-use allowance
++            IRevenueSink(sink).notifyRevenue(stakerAmt);
++        }
+         emit FeeStreamed(id, founderAmt, stakerAmt);
+     }
++    /// F-11: a token-level refusal (blocklist, pause) must not stall the protocol. The amount is
++    /// credited to the payee and can be pulled with withdrawCredit(); the lane stays solvent.
++    function _send(address to, uint256 amount) internal {
++        if (amount == 0) return;
++        // gas floor: a caller must not be able to starve the token call so that it fails and the
++        // payout silently becomes a credit (no theft, but a griefing path). Revert instead.
++        require(gasleft() >= SEND_GAS_FLOOR, "send gas");
++        (bool ok, bytes memory ret) = address(usdc).call(
++            abi.encodeWithSelector(IERC20Min.transfer.selector, to, amount));
++        if (ok && (ret.length == 0 || abi.decode(ret, (bool)))) return;
++        credits[to] += amount;
++        totalCredits += amount;
++        emit Credited(to, amount);
++    }
++    function withdrawCredit() external nonReentrant {
++        uint256 a = credits[msg.sender];
++        require(a > 0, "no credit");
++        credits[msg.sender] = 0;
++        totalCredits -= a;
++        require(usdc.transfer(msg.sender, a), "credit out");
++        emit CreditWithdrawn(msg.sender, a);
++    }
++
+     // ---------------- FIFO payout queue ----------------
+     function _enqueue(address who, uint256 amount, uint64 ticketId) internal {
++        if (amount == 0) return;                                     // F-12: no zero-value entries
+         payoutQueue.push(QueueEntry({ owner: who, amount: uint128(amount), ticketId: ticketId }));
+         queueDebt += amount;
+         queueOf[ticketId] = payoutQueue.length; // entryId+1 for claimInfo()
+@@ -315,7 +379,7 @@ contract DiamondHouse {
+             e.amount -= uint128(pay);
+             pool -= pay;
+             queueDebt -= pay;
+-            require(usdc.transfer(e.owner, pay), "queue out");
++            _send(e.owner, pay);                                    // F-11: never revert the queue
+             emit Dequeued(queueHead, e.owner, pay);
+             if (e.amount == 0) queueHead++;
+             n--;
+@@ -330,10 +394,15 @@ contract DiamondHouse {
+     }
+ 
+     // ---------------- LP vault (optional; pool-backed, first-loss) ----------------
++    // F-04/F-05: virtual shares & assets (ERC-4626 inflation defence). The offset makes a 1-wei
++    // deposit into an orphaned pool worth ~0 shares and makes donation-based share inflation
++    // unprofitable. Virtual shares are never redeemable, so the dust stays in the pool.
++    uint256 public constant VIRTUAL_SHARES = 1e6;
++    uint256 public constant VIRTUAL_ASSETS = 1;
++
+     function lpDeposit(uint256 amount) external nonReentrant returns (uint256 shares) {
+         require(amount > 0, "zero");
+-        if (totalShares == 0 || pool == 0) shares = amount;
+-        else shares = amount * totalShares / pool;
++        shares = amount * (totalShares + VIRTUAL_SHARES) / (navPool() + VIRTUAL_ASSETS);
+         require(shares > 0, "dust");
+         require(usdc.transferFrom(msg.sender, address(this), amount), "pay in");
+         pool += amount;
+@@ -356,11 +425,15 @@ contract DiamondHouse {
+         require(sh > 0, "nothing");
+         require(block.timestamp >= lpExitAvailableAt[msg.sender], "locked");
+         lpPendingExit[msg.sender] = 0;
++        // NAV slice computed BEFORE burning (F-06: senior queue debt is excluded)
++        uint256 amount = sh * (navPool() + VIRTUAL_ASSETS) / (totalShares + VIRTUAL_SHARES);
++        if (amount > navPool()) amount = navPool();
++        // never burn shares for nothing: while queued winners owe more than the pool, NAV is 0
++        // and the exit must wait (reverts → shares and the exit request are kept).
++        require(amount > 0, "nav empty");
+         totalShares -= sh;
+-        uint256 amount = pool == 0 ? 0 : sh * pool / (totalShares + sh); // NAV slice
+-        if (amount > pool) amount = pool;
+         pool -= amount;
+-        require(usdc.transfer(msg.sender, amount), "lp out");
++        _send(msg.sender, amount);
+         emit LpWithdrawn(msg.sender, amount);
+         require(lanesIntact(), "lane drift");
+     }
+@@ -377,7 +450,8 @@ contract DiamondHouse {
+         require(revenueSink != address(0), "no sink");
+         require(amount > 0 && amount <= distributable(), "nothing/too much");
+         pool -= amount;                                   // pre-debit against reentrancy/double-count
+-        IRevenueSink(revenueSink).notifyRevenue(amount);  // sink pulls via transferFrom (approved)
++        require(usdc.approve(revenueSink, amount), "approve");  // F-08: exact allowance
++        IRevenueSink(revenueSink).notifyRevenue(amount);  // sink pulls exactly `amount`
+         emit RevenueDistributed(amount, revenueSink);
+         require(lanesIntact(), "lane drift");
+     }
+@@ -385,15 +459,47 @@ contract DiamondHouse {
+     // ---------------- governance (tighten-only where it matters) ----------------
+     function setClassCfg(uint8 classId, uint32 maxMult2, uint64 profitCap, bool enabled) external onlyOwner {
+         require(maxMult2 >= MIN_MULT_X1E4 && maxMult2 <= MAX_MULT_X1E4, "class mult range");
++        ClassCfg memory old = classCfg[classId];
++        if (old.enabled) {                                          // live class: tighten-only
++            require(maxMult2 <= old.maxMultX1e4 && profitCap <= old.profitCap, "tighten only");
++        }
+         classCfg[classId] = ClassCfg(maxMult2, profitCap, enabled);
+         emit ClassSet(classId, maxMult2, profitCap, enabled);
+     }
+     function setTargetPool(uint256 tp) external onlyOwner { targetPool = tp; emit ParamSet("targetPool", tp); }
+-    function setQuoter(address qa) external onlyOwner { require(qa != address(0), "zero"); quoterSigner = qa; emit ParamSet("quoter", uint256(uint160(qa))); }
+-    function setOutcomeVerifier(address v) external onlyOwner { require(v != address(0), "zero"); outcomeVerifier = v; emit ParamSet("verifier", uint256(uint160(v))); }
++    // F-08: the signing roots can only be swapped through a public 2-day timelock once set.
++    // Initial wiring (zero → value) stays immediate so deployment scripts keep working.
++    function proposeQuoter(address qa) external onlyOwner {
++        require(qa != address(0), "zero");
++        pendingQuoter = Pending(qa, uint64(block.timestamp + GOV_DELAY));
++        emit GovProposed("quoter", qa, pendingQuoter.eta);
++    }
++    function executeQuoter() external {
++        Pending memory p = pendingQuoter;
++        require(p.who != address(0) && block.timestamp >= p.eta, "not ready");
++        quoterSigner = p.who; delete pendingQuoter;
++        emit ParamSet("quoter", uint256(uint160(p.who)));
++    }
++    function proposeOutcomeVerifier(address v) external onlyOwner {
++        require(v != address(0), "zero");
++        pendingVerifier = Pending(v, uint64(block.timestamp + GOV_DELAY));
++        emit GovProposed("verifier", v, pendingVerifier.eta);
++    }
++    function executeOutcomeVerifier() external {
++        Pending memory p = pendingVerifier;
++        require(p.who != address(0) && block.timestamp >= p.eta, "not ready");
++        outcomeVerifier = p.who; delete pendingVerifier;
++        emit ParamSet("verifier", uint256(uint160(p.who)));
++    }
++    function setOutcomeVerifier(address v) external onlyOwner {
++        require(v != address(0) && outcomeVerifier == address(0), "timelocked: use proposeOutcomeVerifier");
++        outcomeVerifier = v; emit ParamSet("verifier", uint256(uint160(v)));
++    }
++    /// Rotating the sink revokes the previous sink's allowance (no stale spender).
+     function setRevenueSink(address s) external onlyOwner {
+-        revenueSink = s;
+-        require(usdc.approve(s, type(uint256).max), "approve");
++        require(s.code.length > 0, "sink must be a contract");   // F-08: an EOA sink would brick settlements
++        if (revenueSink != address(0)) usdc.approve(revenueSink, 0);
++        revenueSink = s;                       // no standing approval: see _streamFee / distributeRevenue
+         emit ParamSet("revenueSink", uint256(uint160(s)));
+     }
+     function setFounderWallet(address f) external onlyOwner { founderWallet = f; emit ParamSet("founderWallet", uint256(uint160(f))); }
+diff --git a/diamondtrading/contracts/DiamondOptions.sol b/diamondtrading/contracts/DiamondOptions.sol
+index dbcf533..747bf27 100644
+--- a/diamondtrading/contracts/DiamondOptions.sol
++++ b/diamondtrading/contracts/DiamondOptions.sol
+@@ -9,6 +9,10 @@
+ //   else goes entirely to the FIFO (no jumping the line). Premiums are house income → pool,
+ //   directly, always (papertrade rule). No QMAX, no pause: positions sell regardless of debt.
+ //   claimInfo(option-id) reports queue position + amount owed.
++//
++// AUDIT FIXES (see audit/report): F-01 solvency lane check + owner sweep; F-08 exact approvals,
++// timelocked verifier/quoter; F-09 ttl signed; F-10 single-use quotes; F-11 non-stalling payouts;
++// F-12 no zero-value queue entries.
+ pragma solidity 0.8.26;
+ 
+ interface IERC20MinO {
+@@ -40,6 +44,7 @@ contract DiamondOptions {
+         uint64  validUntil;
+         bytes32 salt;
+         address buyer;
++        uint64  ttl;            // F-09: duration signed with the quote
+     }
+     struct Option_ {
+         address owner;
+@@ -71,7 +76,9 @@ contract DiamondOptions {
+ 
+     bytes32 public constant OQUOTE_TYPEHASH = keccak256(
+         "OQuote(uint8 classId,uint8 dir,uint128 premium,uint32 multX1e4,uint32 bandBps,"
+-        "uint64 strikeX1e8,uint64 validUntil,bytes32 salt,address buyer)");
++        "uint64 strikeX1e8,uint64 validUntil,bytes32 salt,address buyer,uint64 ttl)");
++    uint256 public constant GOV_DELAY = 2 days;  // F-08
++    uint256 public constant SEND_GAS_FLOOR = 60_000;  // F-11
+ 
+     IERC20MinO public immutable usdc;
+     bytes32 public immutable DOMAIN_SEPARATOR;
+@@ -85,6 +92,13 @@ contract DiamondOptions {
+     address public revenueSink;
+     address public founderWallet;
+ 
++    // F-10 / F-11 / F-08 state
++    mapping(bytes32 => bool) public quoteUsed;
++    mapping(address => uint256) public credits;
++    uint256 public totalCredits;
++    struct Pending { address who; uint64 eta; }
++    Pending public pendingQuoter;
++    Pending public pendingPriceVerifier;
+ 
+     Option_[]   public options;
+     QueueEntry[] public payoutQueue;
+@@ -104,6 +118,9 @@ contract DiamondOptions {
+     event OQueued(uint256 indexed entryId, uint256 indexed optionId, address owner, uint256 amount);
+     event ODequeued(uint256 indexed entryId, address owner, uint256 amount);
+     event ParamSet(string what, uint256 value);
++    event Credited(address indexed to, uint256 amount);
++    event CreditWithdrawn(address indexed to, uint256 amount);
++    event GovProposed(string what, address who, uint64 eta);
+ 
+     constructor(address _usdc, address _quoter) {
+         require(_usdc != address(0) && _quoter != address(0), "zero addr");
+@@ -116,8 +133,15 @@ contract DiamondOptions {
+         ));
+     }
+ 
++    /// F-01 fix: solvency, not equality. Donations cannot freeze the book.
+     function lanesIntact() public view returns (bool) {
+-        return usdc.balanceOf(address(this)) == pool + openPremiums;
++        return usdc.balanceOf(address(this)) >= pool + openPremiums + totalCredits;
++    }
++    function sweepSurplus(address to) external onlyOwner nonReentrant {
++        uint256 b = usdc.balanceOf(address(this));
++        uint256 owed = pool + openPremiums + totalCredits;
++        require(b > owed, "no surplus");
++        require(usdc.transfer(to, b - owed), "sweep out");
+     }
+ 
+     /// queue transparency: position (1 = next to pay) + amount owed; hasDebt=false when clean.
+@@ -157,6 +181,7 @@ contract DiamondOptions {
+         require(q.multX1e4 >= MIN_MULT_X1E4 && q.multX1e4 <= MAX_MULT_X1E4, "mult clamp");
+         require(q.bandBps >= MIN_BAND_BPS && q.bandBps <= MAX_BAND_BPS, "band clamp");
+         require(q.strikeX1e8 >= MIN_STRIKE_X1E8, "strike floor");
++        require(q.ttl == ttl, "ttl mismatch");                       // F-09
+         // strike slippage guard: buyer pins the worst strike they will accept
+         if (q.dir == CALL) require(q.strikeX1e8 <= worstStrikeX1e8, "strike worse");
+         else               require(q.strikeX1e8 >= worstStrikeX1e8, "strike worse");
+@@ -167,9 +192,11 @@ contract DiamondOptions {
+ 
+         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR,
+             keccak256(abi.encode(OQUOTE_TYPEHASH, q.classId, q.dir, q.premium, q.multX1e4,
+-                                 q.bandBps, q.strikeX1e8, q.validUntil, q.salt, msg.sender))));
++                                 q.bandBps, q.strikeX1e8, q.validUntil, q.salt, msg.sender, q.ttl))));
+         require(_recoverSig(digest, sig) == quoterSigner, "bad quote sig");
+         require(q.buyer == msg.sender, "quote not yours");
++        require(!quoteUsed[digest], "quote used");                   // F-10
++        quoteUsed[digest] = true;
+ 
+         uint256 premium = q.premium;
+         uint256 maxPay = premium * q.multX1e4 / 10_000;
+@@ -219,7 +246,7 @@ contract DiamondOptions {
+                 _enqueue(o.owner, net, uint64(id));
+             }
+             o.queuedPay = uint128(net - paidNow);
+-            if (paidNow > 0) require(usdc.transfer(o.owner, paidNow), "pay out");
++            _send(o.owner, paidNow);
+         }
+ 
+         emit OSettled(id, closePx, payout, paidNow, net - paidNow, feeTaken);
+@@ -242,8 +269,11 @@ contract DiamondOptions {
+         uint256 total = founderAmt + stakerAmt;
+         if (total == 0 || pool < total) return; // no realized cash: retain in pool, never underflow
+         pool -= total;
+-        if (founderAmt > 0) require(usdc.transfer(founder, founderAmt), "founder out");
+-        if (stakerAmt > 0) IRevenueSinkO(sink).notifyRevenue(stakerAmt);
++        if (founderAmt > 0) _send(founder, founderAmt);
++        if (stakerAmt > 0) {
++            require(usdc.approve(sink, stakerAmt), "approve");  // F-08: exact allowance
++            IRevenueSinkO(sink).notifyRevenue(stakerAmt);
++        }
+         emit FeeStreamed(id, founderAmt, stakerAmt);
+     }
+     /// Attester stall > 24h past expiry ⇒ premium back verbatim.
+@@ -253,12 +283,35 @@ contract DiamondOptions {
+         require(block.timestamp >= o.expiry + STALL_DELAY, "not stalled");
+         o.state = 2;
+         openPremiums -= o.premium;
+-        require(usdc.transfer(o.owner, o.premium), "refund out");
++        _send(o.owner, o.premium);
+         emit ORefunded(id, o.premium);
+         require(lanesIntact(), "lane drift");
+     }
+ 
++    /// F-11: refused transfers are credited for pull-withdrawal instead of reverting the queue.
++    function _send(address to, uint256 amount) internal {
++        if (amount == 0) return;
++        // gas floor: a caller must not be able to starve the token call so that it fails and the
++        // payout silently becomes a credit (no theft, but a griefing path). Revert instead.
++        require(gasleft() >= SEND_GAS_FLOOR, "send gas");
++        (bool ok, bytes memory ret) = address(usdc).call(
++            abi.encodeWithSelector(IERC20MinO.transfer.selector, to, amount));
++        if (ok && (ret.length == 0 || abi.decode(ret, (bool)))) return;
++        credits[to] += amount;
++        totalCredits += amount;
++        emit Credited(to, amount);
++    }
++    function withdrawCredit() external nonReentrant {
++        uint256 a = credits[msg.sender];
++        require(a > 0, "no credit");
++        credits[msg.sender] = 0;
++        totalCredits -= a;
++        require(usdc.transfer(msg.sender, a), "credit out");
++        emit CreditWithdrawn(msg.sender, a);
++    }
++
+     function _enqueue(address who, uint256 amount, uint64 optionId) internal {
++        if (amount == 0) return;                                     // F-12
+         payoutQueue.push(QueueEntry({ owner: who, amount: uint128(amount), optionId: optionId }));
+         queueDebt += amount;
+         queueOf[optionId] = payoutQueue.length; // entryId+1 for claimInfo()
+@@ -272,7 +325,7 @@ contract DiamondOptions {
+             e.amount -= uint128(pay);
+             pool -= pay;
+             queueDebt -= pay;
+-            require(usdc.transfer(e.owner, pay), "queue out");
++            _send(e.owner, pay);                                    // F-11
+             emit ODequeued(queueHead, e.owner, pay);
+             if (e.amount == 0) queueHead++;
+             n--;
+@@ -287,17 +340,46 @@ contract DiamondOptions {
+     // ---------------- governance ----------------
+     function setClassCfg(uint8 classId, uint32 maxMult2, uint64 payCap, bool enabled) external onlyOwner {
+         require(maxMult2 >= MIN_MULT_X1E4 && maxMult2 <= MAX_MULT_X1E4, "class mult range");
++        ClassCfg memory old = classCfg[classId];
++        if (old.enabled) require(maxMult2 <= old.maxMultX1e4 && payCap <= old.payCap, "tighten only");
+         classCfg[classId] = ClassCfg(maxMult2, payCap, enabled);
+         emit ParamSet("classCfg", uint256(classId));
+     }
+-    function setQuoter(address qa) external onlyOwner { require(qa != address(0), "zero"); quoterSigner = qa; emit ParamSet("quoter", uint256(uint160(qa))); }
++    function proposeQuoter(address qa) external onlyOwner {
++        require(qa != address(0), "zero");
++        pendingQuoter = Pending(qa, uint64(block.timestamp + GOV_DELAY));
++        emit GovProposed("quoter", qa, pendingQuoter.eta);
++    }
++    function executeQuoter() external {
++        Pending memory p = pendingQuoter;
++        require(p.who != address(0) && block.timestamp >= p.eta, "not ready");
++        quoterSigner = p.who; delete pendingQuoter;
++        emit ParamSet("quoter", uint256(uint160(p.who)));
++    }
++    function proposePriceVerifier(address v) external onlyOwner {
++        require(v != address(0), "zero");
++        pendingPriceVerifier = Pending(v, uint64(block.timestamp + GOV_DELAY));
++        emit GovProposed("verifier", v, pendingPriceVerifier.eta);
++    }
++    function executePriceVerifier() external {
++        Pending memory p = pendingPriceVerifier;
++        require(p.who != address(0) && block.timestamp >= p.eta, "not ready");
++        priceVerifier = p.who; delete pendingPriceVerifier;
++        emit ParamSet("verifier", uint256(uint160(p.who)));
++    }
++    /// Rotating the sink revokes the previous sink's allowance (F-08).
+     function setRevenueSink(address s) external onlyOwner {
++        require(s.code.length > 0, "sink must be a contract");   // F-08: an EOA sink would brick settlements
++        if (revenueSink != address(0)) usdc.approve(revenueSink, 0);
+         revenueSink = s;
+-        require(usdc.approve(s, type(uint256).max), "approve");
+         emit ParamSet("revenueSink", uint256(uint160(s)));
+     }
+     function setFounderWallet(address f) external onlyOwner { founderWallet = f; emit ParamSet("founderWallet", uint256(uint160(f))); }
+-    function setPriceVerifier(address v) external onlyOwner { require(v != address(0), "zero"); priceVerifier = v; emit ParamSet("verifier", uint256(uint160(v))); }
++    /// Initial wiring only (zero → value); afterwards use proposePriceVerifier / executePriceVerifier.
++    function setPriceVerifier(address v) external onlyOwner {
++        require(v != address(0) && priceVerifier == address(0), "timelocked: use proposePriceVerifier");
++        priceVerifier = v; emit ParamSet("verifier", uint256(uint160(v)));
++    }
+ 
+     function _recoverSig(bytes32 digest, bytes calldata sig) internal pure returns (address) {
+         require(sig.length == 65, "sig len");
+diff --git a/diamondtrading/contracts/RevenueSplit.sol b/diamondtrading/contracts/RevenueSplit.sol
+index b5a1f74..c7aa8b7 100644
+--- a/diamondtrading/contracts/RevenueSplit.sol
++++ b/diamondtrading/contracts/RevenueSplit.sol
+@@ -13,6 +13,15 @@ interface IERC20MinR {
+ /// audit lesson H-01/H-02/KV-06: no cross-domain cursors).
+ /// Authorized House/Options engines pull-transfer their own USDC into this contract atomically.
+ /// Per-win fee streams and the owner's surplus waterfall share the same cumulative-index rewards.
++///
++/// AUDIT FIXES (audit/report):
++///  F-02 (JIT): revenue is STREAMED linearly over DURATION (7 days) instead of being credited
++///       instantly to whoever is staked at notify time. A stake added right before a settlement
++///       earns only its pro-rata share of the stream, and nothing if it leaves before accruing.
++///  F-13 (stranded): revenue notified while nobody is staked is carried and starts streaming as
++///       soon as the first staker arrives (never stranded). Stream time does not elapse while
++///       totalStaked == 0 (the stream is paused, not lost).
++///  F-11: a token-level refusal to pay a reward does not revert the staker's exit; it is credited.
+ contract RevenueSplit {
+     IERC20MinR public immutable usdc;
+     IERC20MinR public immutable diamond;
+@@ -21,14 +30,28 @@ contract RevenueSplit {
+     mapping(address => bool) public pusher;  // additional payout engines (options…) allowed to push
+ 
+     uint64 public constant UNBOND_DELAY = 7 days;
++    uint64 public constant DURATION = 7 days;   // F-02: reward stream length
++    uint256 public constant SEND_GAS_FLOOR = 60_000;
+ 
+     uint256 public totalStaked;
+     mapping(address => uint256) public staked;
+ 
+-    // reward accrual index (1e18-scaled USDC per 1 DIAMOND staked)
++    // reward accrual index, 1e36-scaled: index units per DIAMOND-wei. 1e36 (not 1e18) keeps the
++    // flooring error below 1 base unit per claim; at 1e18 it reached ~staked/1e18 base units.
++    uint256 public constant SCALE = 1e36;
+     uint256 public rewardIndex;
+     mapping(address => uint256) public userIndex;
+ 
++    // streaming state (F-02)
++    uint256 public rewardRate;      // USDC base units × SCALE per second
++    uint256 public periodFinish;
++    uint256 public lastUpdate;
++    uint256 public carry;           // F-13: revenue waiting for the first staker (USDC base units)
++
++    // F-11: credits for refused payouts
++    mapping(address => uint256) public credits;
++    uint256 public totalCredits;
++
+     struct Unbond { uint256 amount; uint64 availableAt; }
+     mapping(address => Unbond) public unbonding;
+ 
+@@ -40,7 +63,10 @@ contract RevenueSplit {
+     event UnbondRequested(address indexed who, uint256 amount, uint64 availableAt);
+     event Withdrawn(address indexed who, uint256 amount);
+     event RevenueNotified(uint256 amount, uint256 newIndex);
++    event RevenueCarried(uint256 amount);
+     event RewardClaimed(address indexed who, uint256 amount);
++    event Credited(address indexed who, uint256 amount);
++    event CreditWithdrawn(address indexed who, uint256 amount);
+     event HouseSet(address indexed house);
+     event PusherSet(address indexed who, bool allowed);
+ 
+@@ -53,11 +79,50 @@ contract RevenueSplit {
+     function setHouse(address h) external onlyOwner { require(h != address(0), "zero"); house = h; emit HouseSet(h); }
+     function setPusher(address h, bool allowed) external onlyOwner { pusher[h] = allowed; emit PusherSet(h, allowed); }
+ 
++    // ---------------- streaming core ----------------
++
++    /// Bring the index up to now. Must run before any change to totalStaked.
++    function _update() internal {
++        uint256 nowTs = block.timestamp;
++        if (nowTs <= lastUpdate) return;
++        if (totalStaked == 0) {
++            // paused: the stream's remaining time is preserved, not consumed by nobody
++            if (periodFinish > lastUpdate) periodFinish += nowTs - lastUpdate;
++            lastUpdate = nowTs;
++            return;
++        }
++        uint256 t = nowTs < periodFinish ? nowTs : periodFinish;
++        if (t > lastUpdate) rewardIndex += rewardRate * (t - lastUpdate) / totalStaked;
++        lastUpdate = nowTs;
++    }
++
++    /// Add `amt` (plus any carry) to the running stream, keeping the unfinished remainder.
++    function _addToStream(uint256 amt) internal {
++        amt += carry; carry = 0;
++        if (amt == 0) return;
++        uint256 leftover = block.timestamp < periodFinish
++            ? rewardRate * (periodFinish - block.timestamp) : 0;
++        rewardRate = (amt * SCALE + leftover) / DURATION;
++        periodFinish = block.timestamp + DURATION;
++        lastUpdate = block.timestamp;
++    }
++
++    function _currentIndex() internal view returns (uint256 idx) {
++        idx = rewardIndex;
++        if (totalStaked > 0 && block.timestamp > lastUpdate) {
++            uint256 t = block.timestamp < periodFinish ? block.timestamp : periodFinish;
++            if (t > lastUpdate) idx += rewardRate * (t - lastUpdate) / totalStaked;
++        }
++    }
++
++    // ---------------- user actions ----------------
++
+     function stake(uint256 amount) external nonReentrant {
+-        _settleReward(msg.sender);
++        _settleReward(msg.sender);                 // also runs _update()
+         require(diamond.transferFrom(msg.sender, address(this), amount), "pay");
+         staked[msg.sender] += amount;
+         totalStaked += amount;
++        if (carry > 0) _addToStream(0);            // F-13: first staker starts the carried stream
+         emit Staked(msg.sender, amount);
+     }
+ 
+@@ -81,31 +146,55 @@ contract RevenueSplit {
+         emit Withdrawn(msg.sender, amt);
+     }
+ 
+-    /// Authorized engines only; pulls amount from msg.sender (House or Options).
++    /// Authorized engines only; pulls exactly `amount` from msg.sender (House or Options).
+     function notifyRevenue(uint256 amount) external {
+         require(msg.sender == house || pusher[msg.sender], "not house");
+         require(usdc.transferFrom(msg.sender, address(this), amount), "pay in");
++        _update();
+         if (totalStaked > 0) {
+-            rewardIndex += amount * 1e18 / totalStaked;
++            _addToStream(amount);
++        } else {
++            carry += amount;                        // F-13: never stranded
++            emit RevenueCarried(amount);
+         }
+         emit RevenueNotified(amount, rewardIndex);
+     }
+ 
+     function claimable(address who) external view returns (uint256) {
+-        uint256 idx = rewardIndex;
+-        return staked[who] * (idx - userIndex[who]) / 1e18;
++        return staked[who] * (_currentIndex() - userIndex[who]) / SCALE + credits[who];
+     }
+ 
+     function claimReward() external nonReentrant {
+         _settleReward(msg.sender);
+     }
+ 
++    function withdrawCredit() external nonReentrant {
++        uint256 a = credits[msg.sender];
++        require(a > 0, "no credit");
++        credits[msg.sender] = 0;
++        totalCredits -= a;
++        require(usdc.transfer(msg.sender, a), "credit out");
++        emit CreditWithdrawn(msg.sender, a);
++    }
++
+     function _settleReward(address who) internal {
+-        uint256 owed = staked[who] * (rewardIndex - userIndex[who]) / 1e18;
++        _update();
++        uint256 owed = staked[who] * (rewardIndex - userIndex[who]) / SCALE;
+         userIndex[who] = rewardIndex;
+-        if (owed > 0) {
+-            require(usdc.transfer(who, owed), "reward out");
+-            emit RewardClaimed(who, owed);
++        if (owed > 0) _send(who, owed);
++    }
++
++    /// F-11: a refused transfer is credited instead of reverting (exit can never be blocked).
++    function _send(address to, uint256 amount) internal {
++        require(gasleft() >= SEND_GAS_FLOOR, "send gas");   // see DiamondHouse._send
++        (bool ok, bytes memory ret) = address(usdc).call(
++            abi.encodeWithSelector(IERC20MinR.transfer.selector, to, amount));
++        if (ok && (ret.length == 0 || abi.decode(ret, (bool)))) {
++            emit RewardClaimed(to, amount);
++            return;
+         }
++        credits[to] += amount;
++        totalCredits += amount;
++        emit Credited(to, amount);
+     }
+ }
+diff --git a/diamondtrading/engine/ledger.js b/diamondtrading/engine/ledger.js
+index d0b2494..57565fe 100644
+--- a/diamondtrading/engine/ledger.js
++++ b/diamondtrading/engine/ledger.js
+@@ -10,8 +10,10 @@
+ // leaf = keccak256(concat(keccak256(abi.encode(epochId, account, amount))))).
+ import { ethers } from "ethers";
+ 
+-export const MINT_RATE = { R_MAX_BPS: 20000, R_FLOOR_BPS: 3000, STEP_DOWN_BPS: 250, STEP_UP_BPS: 1000 };
+-export const LAUNCH_RATE_BPS = 20000;
++// F-14 fix: ceiling is 100% of REALIZED revenue. 200% let hedged farms mint more than they
++// ever paid the house (the old figures are kept in audit/report as the vulnerable baseline).
++export const MINT_RATE = { R_MAX_BPS: 10000, R_FLOOR_BPS: 3000, STEP_DOWN_BPS: 250, STEP_UP_BPS: 1000 };
++export const LAUNCH_RATE_BPS = 10000;
+ 
+ /** Mirror of DiamondDistributor.projectedRateBps — given the rate stored on-chain and the
+  *  previous signed anchor (null on the very first epoch). */
+@@ -51,8 +53,10 @@ export class EpochLedger {
+       a.fees += r.feePaid; acc.set(r.owner, a);
+       stakeSum += r.stake; paySum += r.payout; feeSum += r.feePaid;
+     }
+-    const edge = stakeSum > paySum ? stakeSum - paySum : 0n;   // realized house edge (incl. fees)
+-    const anchor = feeSum + edge;                              // phí thực thu + edge thực hiện
++    // realized house P&L for the epoch. `payout` already has the fee removed, so stake − payout
++    // INCLUDES the fee: the anchor is this number alone (F-14: adding fees again double-counted).
++    const edge = stakeSum > paySum ? stakeSum - paySum : 0n;
++    const anchor = edge;
+     return { acc, revenue: edge, fees: feeSum, anchor };
+   }
+ 
+@@ -130,9 +134,15 @@ export function buildMerkle(epochId, entries /* Map<address, amount> | [[address
+ }
+ 
+ /** budgetAttester signs the revenue anchor + reference price: EIP-191 personal_sign over
+- *  keccak256(abi.encode(epochId, anchorUsd, priceX1e8)) — mirror of EdgeDistributor.postEpoch v2. */
+-export function signRevenueAnchor(wallet, epochId, anchorUsd, priceX1e8) {
++ *  keccak256(abi.encode(chainId, distributor, epochId, anchorUsd, priceX1e8)) — mirror of
++ *  DiamondDistributor.postEpoch. D2 fix: domain-bound, so a signature cannot be replayed on
++ *  another chain or another distributor deployment. `domain` is REQUIRED. */
++export function signRevenueAnchor(wallet, epochId, anchorUsd, priceX1e8, domain) {
++  if (!domain || domain.chainId === undefined || !domain.distributor) {
++    throw new Error("signRevenueAnchor: domain {chainId, distributor} is required");
++  }
+   const h = ethers.keccak256(ethers.AbiCoder.defaultAbiCoder()
+-    .encode(["uint256", "uint256", "uint256"], [epochId, anchorUsd, priceX1e8]));
++    .encode(["uint256", "address", "uint256", "uint256", "uint256"],
++            [domain.chainId, domain.distributor, epochId, anchorUsd, priceX1e8]));
+   return wallet.signMessage(ethers.getBytes(h));
+ }
+diff --git a/diamondtrading/engine/quoter.js b/diamondtrading/engine/quoter.js
+index bc16243..8a62b90 100644
+--- a/diamondtrading/engine/quoter.js
++++ b/diamondtrading/engine/quoter.js
+@@ -1,17 +1,21 @@
+ // Quoter: assembles and EIP-712-signs quotes for DiamondHouse (binary tickets) and
+ // DiamondOptions (capped-vanilla spreads). Domain/types must mirror the contracts exactly.
++//
++// F-09 fix: `ttl` (the duration the multiplier was priced for, τ in seconds) is part of the
++// signed payload. A quote is therefore valid for exactly one duration; the buyer cannot switch
++// to a shorter/longer ttl that the quoter did not price. F-10: each quote is single-use on-chain.
+ export const HOUSE_TYPES = { Quote: [
+   { name: "classId", type: "uint8" }, { name: "dir", type: "uint8" },
+   { name: "stake", type: "uint128" }, { name: "multX1e4", type: "uint32" },
+   { name: "validUntil", type: "uint64" }, { name: "salt", type: "bytes32" },
+-  { name: "buyer", type: "address" } ] };
++  { name: "buyer", type: "address" }, { name: "ttl", type: "uint64" } ] };
+ 
+ export const OPTIONS_TYPES = { OQuote: [
+   { name: "classId", type: "uint8" }, { name: "dir", type: "uint8" },
+   { name: "premium", type: "uint128" }, { name: "multX1e4", type: "uint32" },
+   { name: "bandBps", type: "uint32" }, { name: "strikeX1e8", type: "uint64" },
+   { name: "validUntil", type: "uint64" }, { name: "salt", type: "bytes32" },
+-  { name: "buyer", type: "address" } ] };
++  { name: "buyer", type: "address" }, { name: "ttl", type: "uint64" } ] };
+ 
+ export class Quoter {
+   constructor(wallet, { houseAddr, optionsAddr, chainId }) {
+@@ -21,10 +25,12 @@ export class Quoter {
+     if (houseAddr) this.domains.house = { name: "DiamondHouse", version: "1", chainId, verifyingContract: houseAddr };
+     if (optionsAddr) this.domains.options = { name: "DiamondOptions", version: "1", chainId, verifyingContract: optionsAddr };
+   }
+-  async signTicket(value) {   // value: HOUSE_TYPES.Quote fields
++  async signTicket(value) {   // value: HOUSE_TYPES.Quote fields (ttl REQUIRED, F-09)
++    if (value.ttl === undefined) throw new Error("signTicket: ttl is required (signed field)");
+     return { q: value, sig: await this.w.signTypedData(this.domains.house, HOUSE_TYPES, value) };
+   }
+-  async signOption(value) {   // value: OPTIONS_TYPES.OQuote fields
++  async signOption(value) {   // value: OPTIONS_TYPES.OQuote fields (ttl REQUIRED, F-09)
++    if (value.ttl === undefined) throw new Error("signOption: ttl is required (signed field)");
+     return { q: value, sig: await this.w.signTypedData(this.domains.options, OPTIONS_TYPES, value) };
+   }
+ }
+diff --git a/diamondtrading/scripts/deploy.js b/diamondtrading/scripts/deploy.js
+index 594a437..3df4cd2 100644
+--- a/diamondtrading/scripts/deploy.js
++++ b/diamondtrading/scripts/deploy.js
+@@ -1,23 +1,55 @@
+ // Demo deployment for user testing: realistic menu + seeded state on local ganache.
+-// Run: node scripts/deploy.js  (expects an EVM RPC at $RPC or http://127.0.0.1:8545)
++// Run (demo, local chain only):  DEMO_KEYS=1 node scripts/deploy.js
++// Run (any other chain):         QUOTER_KEY, ATTESTER_KEY_1..3, BUDGETER_KEY must be set (env only)
++// Expects an EVM RPC at $RPC or http://127.0.0.1:8545.
++//
++// F-07 fix: the signing roles are derived from a PUBLIC mnemonic ("test test ... junk").
++// Anyone can derive those keys, so they are only ever used when DEMO_KEYS=1 AND the chain is a
++// local dev chain. Otherwise the script refuses to run (exit code 2) and never falls back to
++// demo keys.
+ const { ethers } = require("ethers");
+ const fs = require("fs");
+ const path = require("path");
+ 
++const DEMO_MNEMONIC = "test test test test test test test test test test test junk";
++const LOCAL_CHAIN_IDS = new Set([31337, 1337]);   // hardhat/anvil, ganache
++const ENV_KEYS = ["QUOTER_KEY", "ATTESTER_KEY_1", "ATTESTER_KEY_2", "ATTESTER_KEY_3", "BUDGETER_KEY"];
++
++function refuse(msg) {
++  console.error("deploy refused: " + msg);
++  process.exit(2);
++}
++
++/** Resolve the signing roles or refuse. Returns { quoter, att1, att2, att3, budgeter } wallets (unconnected). */
++function resolveKeys(chainId) {
++  if (process.env.DEMO_KEYS === "1") {               // chainId===null ⇒ caller will re-check on-chain
++    if (chainId === null || !LOCAL_CHAIN_IDS.has(chainId)) refuse(`DEMO_KEYS=1 is only allowed on local chains (got chainId ${chainId})`);
++    const hd = (i) => ethers.HDNodeWallet.fromPhrase(DEMO_MNEMONIC, undefined, `m/44'/60'/0'/0/${i}`);
++    return { quoter: hd(21), att1: hd(31), att2: hd(32), att3: hd(33), budgeter: hd(41), demo: true };
++  }
++  const missing = ENV_KEYS.filter((k) => !process.env[k]);
++  if (missing.length) refuse(`no signing keys (missing env: ${missing.join(", ")}); set them or use DEMO_KEYS=1 on a local chain`);
++  const w = (k) => new ethers.Wallet(process.env[k]);
++  return { quoter: w("QUOTER_KEY"), att1: w("ATTESTER_KEY_1"), att2: w("ATTESTER_KEY_2"),
++           att3: w("ATTESTER_KEY_3"), budgeter: w("BUDGETER_KEY"), demo: false };
++}
++
+ const art = (n) => JSON.parse(fs.readFileSync(path.join(__dirname, "..", "build", `${n}.json`), "utf8"));
+ const U = (n) => BigInt(n) * 10n ** 6n;
+ const E18 = (n) => BigInt(n) * 10n ** 18n;
+ 
+ (async () => {
++  // F-07: refuse BEFORE touching the network when no explicit keys and no demo opt-in exist.
++  if (process.env.DEMO_KEYS !== "1") resolveKeys(null);   // env path: missing keys → exit 2
+   const rpc = process.env.RPC || "http://127.0.0.1:8545";
+   const provider = new ethers.JsonRpcProvider(rpc);
+   const chainId = Number((await provider.getNetwork()).chainId);
++  const keys = resolveKeys(chainId);                 // F-07: guard runs before anything is deployed
+   const accs = await provider.listAccounts();
+   const owner = await provider.getSigner(accs[0].address);
+-  const hd = (i) => ethers.HDNodeWallet
+-    .fromPhrase("test test test test test test test test test test test junk", undefined, `m/44'/60'/0'/0/${i}`)
+-    .connect(provider);
+-  const quoter = hd(21), att1 = hd(31), att2 = hd(32), att3 = hd(33), budgeter = hd(41);
++  const conn = (w) => w.connect(provider);
++  const quoter = conn(keys.quoter), att1 = conn(keys.att1), att2 = conn(keys.att2), att3 = conn(keys.att3), budgeter = conn(keys.budgeter);
++  if (keys.demo) console.warn("WARNING: DEMO_KEYS=1 — public test mnemonic signing keys on local chain " + chainId);
+ 
+   const C = (n, s) => new ethers.ContractFactory(art(n).abi, art(n).bytecode, s);
+   const usdc = await (await C("MockUSDC", owner).deploy()).waitForDeployment();
+@@ -87,7 +119,7 @@ const E18 = (n) => BigInt(n) * 10n ** 18n;
+     },
+     demoStaking: { mintedToOwner: "100000 DIAMOND", stakedByOwner: "10000 DIAMOND" },
+     keys: { quoter: quoter.address, attesters: [att1.address, att2.address, att3.address], budgeter: budgeter.address },
+-    note: "demo only — ganache deterministic mnemonic, DO NOT send real funds",
++    note: keys.demo ? "demo only — public deterministic mnemonic, local chain, DO NOT send real funds" : "signing keys supplied via env",
+   };
+   fs.writeFileSync(path.join(__dirname, "..", "deploy.json"), JSON.stringify(out, null, 2));
+   console.log(JSON.stringify(out, null, 2));

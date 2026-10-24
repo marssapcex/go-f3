@@ -1,0 +1,267 @@
+
+> diamondtrading@0.2.0 test
+> node compile.js && node test/diamond.test.js && node test/engine.test.js && SEED=1337 node test/fuzz.js
+
+OK DiamondDistributor.sol:DiamondDistributor  bytecode=4152 bytes
+OK DiamondDistributor.sol:IDiamondToken  bytecode=0 bytes
+OK DiamondHouse.sol:DiamondHouse  bytecode=15923 bytes
+OK DiamondHouse.sol:IERC20Min  bytecode=0 bytes
+OK DiamondHouse.sol:IOutcomeVerifier  bytecode=0 bytes
+OK DiamondHouse.sol:IRevenueSink  bytecode=0 bytes
+OK DiamondOptions.sol:DiamondOptions  bytecode=13695 bytes
+OK DiamondOptions.sol:IERC20MinO  bytecode=0 bytes
+OK DiamondOptions.sol:IPriceVerifier  bytecode=0 bytes
+OK DiamondOptions.sol:IRevenueSinkO  bytecode=0 bytes
+OK DiamondToken.sol:DiamondToken  bytecode=2606 bytes
+OK MockUSDC.sol:MockUSDC  bytecode=1417 bytes
+OK RevenueSplit.sol:IERC20MinR  bytecode=0 bytes
+OK RevenueSplit.sol:RevenueSplit  bytecode=5106 bytes
+OK Verifiers.sol:IOutcomeVerifier  bytecode=0 bytes
+OK Verifiers.sol:IPriceVerifier  bytecode=0 bytes
+OK Verifiers.sol:MultiAttesterVerifier  bytecode=3085 bytes
+OK Verifiers.sol:MultiPriceVerifier  bytecode=3099 bytes
+compile: success
+This version of µWS is not compatible with your Node.js build:
+
+Error: Cannot find module '../binaries/uws_linux_x64_127.node'
+Require stack:
+- /home/user/go-f3/diamondtrading/node_modules/ganache/node_modules/@trufflesuite/uws-js-unofficial/src/uws.js
+- /home/user/go-f3/diamondtrading/node_modules/ganache/dist/node/core.js
+- /home/user/go-f3/diamondtrading/test/diamond.test.js
+Falling back to a NodeJS implementation; performance may be degraded.
+
+
+
+[SALES] pool=0 sales, no QMAX (v3), no pause switch, class caps, quote rules
+  PASS pool starts at 0
+  PASS ticket sells with pool = 0 (v2 point)
+  PASS lanes intact after pool-0 sale
+  PASS revert: profit over class cap rejected
+  PASS revert: below mult floor rejected
+  PASS revert: ttl outside set rejected
+  PASS revert: wrong-domain signature rejected
+  PASS revert: quote bound to buyer
+  PASS revert: slippage bound enforced
+  PASS no pauseSales — house cannot freeze (permissionless by design)
+  PASS lanes intact after LP deposit
+  PASS whale win queues exact shortfall (net − pool 1000)
+  PASS pool spent first; fee is a claim haircut, no cash lane
+  PASS lanes intact after queued win
+  PASS sales continue while queue has debt (v3: no QMAX brake)
+  PASS inline harvest paid the lost stake (10) into FIFO from pool
+  PASS claimInfo: whale is #1 in line, exact owed post-inline
+  PASS claimInfo: loser ticket has no debt but sees total house debt
+
+[FEE-SPLIT] 3.99% ρ streaming — founder wallet settable later, unset ⇒ stakers take all
+  PASS no stakers + founder unset: fee remains in pool, nothing is stranded in sink
+  PASS boundary setup: pool exactly equals the next net claim
+  PASS pool=net pays winner without underflow or imaginary fee stream
+  PASS net-only coverage leaves staker rewards at zero
+  PASS FeeStreamed emitted on fully-covered win
+  PASS founder unset ⇒ whole 3.99% to stakers
+  PASS sink pulled the staker slice (pull-based)
+  PASS stream: nothing claimable at notify time (streams over 7d)
+  PASS staker claimable equals the full 3.99% after the 7d stream
+  PASS lanes after stream-1
+  PASS setFounderWallet writable (will be multisig/EOA at launch)
+  PASS 0.99% founder / 3.00% stakers split exact
+  PASS founder wallet received 0.99% of profit
+  PASS stakers received the 3% slice
+  PASS stream-2 starts at 0: claimable is still stream-1 only
+  PASS staker claimable accumulates 3.99% + 3.00% after both streams
+  PASS staker actually claims the streamed USDC rewards
+  PASS ρ is now 3.99% (below recalled competitor 4-6% range)
+  PASS debt-phase win streams zero fee (no cash was realized)
+  PASS debt exists (shortfall queued)
+  PASS lanes end of [FEE-SPLIT]
+
+[Q1] pool≈0: exact debt, FIFO, harvest(n), inline-4, no cut-in-line, claimInfo
+  PASS queued shortfall exact = 17241900000
+  PASS stake back + pool-covered slice instantly
+  PASS pool fully spent on the whale (fee never books a cash lane)
+  PASS lanes after whale
+  PASS claimInfo: whale sees itself #1 in line, exact amount, totalDebt
+  PASS in-debt winner #0: stake back only
+  PASS in-debt winner #1: stake back only
+  PASS in-debt winner #2: stake back only
+  PASS in-debt winner #3: stake back only
+  PASS four in-debt wins fully queued behind the whale
+  PASS claimInfo: first small winner is #2, full net queued
+  PASS lanes after in-debt wins
+  PASS FIFO head is the oldest winner
+  PASS inline-4 paid oldest entry from pool (debt −1,000)
+  PASS loser cash went straight to the queue (pool drained by inline harvest)
+  PASS revert: harvest n > 64 rejected
+  PASS harvest with empty pool is a no-op
+  PASS inline-4: whale fully paid, small entries partially paid
+  PASS claimInfo: whale already paid in full, stops reporting
+  PASS 1,000-loss clears the remaining small queue
+  PASS loser surplus (1000 − owed) stays in pool
+  PASS queue stays clean
+  PASS clean-phase loss feeds pool directly (papertrade)
+  PASS claimInfo: nothing to report for paid whale
+  PASS lanes after queue clear
+  PASS whale received stake + FULL net profit via inline FIFO pays
+  PASS (b2 totals verified per-step above)
+  PASS revert: double settle rejected
+  PASS revert: refund after settle rejected
+  PASS clean-queue loss becomes pool money directly (12+100)
+  PASS revert: early stall refund rejected
+  PASS 24h stall refunds full stake
+  PASS revert: settle after refund rejected
+  PASS revert: EXPIRED before expiry rejected
+  PASS EXPIRED rebates 15% of stake
+  PASS lanes end of [Q1]
+
+[MINT] pool=0 mints, counter-cyclical adaptive rate, absolute cap, anchor+price sig
+  PASS launch rate constant 100% (F-14)
+  PASS epoch 1 keeps launch rate (no prior anchor)
+  PASS growth epoch tightens −250bps off 100%
+  PASS weak epoch eases +1000bps, capped at ceiling
+  PASS tightening continues mid-range
+  PASS tightening pins at 30% floor
+  PASS easing never exceeds 100% ceiling
+  PASS contract boots at 100%
+  PASS epoch-1 projection keeps launch rate
+  PASS budgetFor = 100% × anchor ÷ price at launch
+  PASS anchor = realized edge only (fees already inside stake−payout; F-14)
+  PASS epoch-0 budget = 100% × anchor ÷ price (uncapped arm)
+  PASS epoch-0 budget = formula at $0.01
+  PASS epoch-0 budget clamps at cap when formula exceeds it
+  PASS total within budget
+  PASS net winner mints nothing
+  PASS zero-fee farmer mints nothing
+  PASS weights √(netLoss×fees)×loyalty intact
+  PASS absolute epoch cap binds at 2M DIAMOND
+  PASS epoch-1 posts with (anchor, price) attestation
+  PASS rate still 100% after epoch-1 (launch phase intact)
+  PASS weak anchor eases +1000, clamped at the 100% ceiling
+  PASS growth anchor siết −250 → 97.5%
+  PASS sustained growth grinds −250 more → 95%
+  PASS revert: reused/mismatched anchor sig rejected
+  PASS net loser claims DIAMOND on-chain
+  PASS token is DIAMOND / DiamondToken
+  PASS revert: p2p transfer locked in bootstrap
+  PASS allowlist settable
+  PASS revert: still locked without allowlisted peer
+  PASS transfers work after one-way enable
+  PASS revert: LP exit before 7d rejected
+  PASS revert: LP exit with zero NAV refused, shares kept
+  PASS refused exit leaves shares and totalShares untouched
+  PASS LP balance unchanged on refused exit
+  PASS lanes after LP cycle
+
+[FARM] hedge pair: combined mint ≤ rate × fees the pair paid
+  PASS hedge winner leg mints zero
+  PASS pair anchor = realized P&L (200), fees not added twice
+  PASS budget = 100% of realized P&L
+  PASS pair mint ≤ budget anchored on its own realized P&L
+  PASS mint value ≤ 1× realized anchor at launch rate 100%
+
+[REV] distribution locked by queue/target; 80% rule; exact pull
+  PASS below targetPool: distributable = 0
+  PASS revert: distribution below target rejected
+  PASS pool = 600k after whale loss
+  PASS distributable = 80% of (pool − target)
+  PASS revert: over-distributable rejected
+  PASS exactly amount leaves house (pull-based)
+  PASS pool retained 520k (target + 20% of excess)
+  PASS debt exists after whale win
+  PASS distributable = 0 while queue has debt
+  PASS revert: distribution while in debt rejected
+  PASS lanes intact end of [REV]
+
+[SETTLE] attester quorum/substitution, threshold floor
+  PASS revert: threshold floor at 2
+  PASS revert: single attester rejected
+  PASS revert: outcome substitution rejected
+  PASS revert: duplicate signer discounted
+  PASS 2-of-3 settles
+  PASS lanes intact end of [SETTLE]
+
+==== diamond v3: 133 passed, 0 failed ====
+This version of µWS is not compatible with your Node.js build:
+
+Error: Cannot find module '../binaries/uws_linux_x64_127.node'
+Require stack:
+- /home/user/go-f3/diamondtrading/node_modules/ganache/node_modules/@trufflesuite/uws-js-unofficial/src/uws.js
+- /home/user/go-f3/diamondtrading/node_modules/ganache/dist/node/core.js
+- /home/user/go-f3/diamondtrading/test/engine.test.js
+Falling back to a NodeJS implementation; performance may be degraded.
+
+
+
+[EA] G1 routing + G3 caps + G4 breaker + G8 tolerance (mock venues)
+  PASS router picks deepest venue
+  PASS no dual-read when runner-up < 30% depth
+  PASS dual-read when runner-up >= 30%
+  PASS BTC-class flow ceiling = 35000 (pool-independent)
+  PASS on-chain class profit cap binds when tighter
+  PASS thin-venue ceiling = 1000 (λ floor)
+  PASS dual-read relaxes κ to 1/3
+  PASS mint launch rate = 100% of realized revenue (F-14)
+  PASS first epoch keeps launch rate
+  PASS growth tightens −250bps
+  PASS weakness eases +1000bps (ceiling-capped at 100%)
+  PASS floor 30% pin
+  PASS normal vol allowed
+  PASS spike trips breaker
+  PASS cooldown holds
+  PASS breaker resets after cooldown
+
+[EB] G2 TWAP persistence (TradeTape)
+  PASS vwap volume-weighted inside window only
+  PASS empty window = NO-PRINT (null)
+  PASS out-of-order trade dropped
+
+[EC] pricer
+  PASS higher σ => larger fair multiplier (bust likelier)
+  PASS low leverage rarely busts
+  PASS ρ=3.99% haircut applied
+  PASS on-chain envelope clamp
+
+[ED] G8 agreePrice
+  PASS venues within 12bp agree
+  PASS venues beyond 12bp refuse
+  PASS single-read passes through
+
+[EE] interop: engine signatures vs contracts on ganache
+  PASS engine-quoted OQuote passes contract EIP-712 and sells
+  PASS premium lane booked from engine quote (v2: no reserve)
+  PASS engine-attested settle: pool-covered slice paid instantly
+  PASS rest queued FIFO at 3.99% fee — pool=0 playable
+  PASS options lanes intact
+  PASS losing option funds pool and clears prior FIFO debt
+  PASS Options FeeStreamed splits 0.99% founder / 3.00% stakers
+  PASS Options founder receives exactly 0.99% of gross payout
+  PASS Options staker slice is pulled into the sink and streams (0 claimable at notify)
+  PASS Options lanes intact after fee stream
+  PASS dual venues agree within tolerance -> signable
+  PASS dual venues 20bp apart -> NO-SIGN
+  PASS ledger anchor (realized edge only) = 10400000000
+  PASS epoch-0 budget = 100% × anchor ÷ price (cap not binding at $0.01)
+  PASS absolute cap binds when the price is halved
+  PASS net winner gets no mint
+  PASS zero-fee loss farmer gets no mint
+  PASS loyal bigger-loser earns more
+  PASS weights follow √(loss×fees)×loyalty
+  PASS tightened regime (30%) shrinks the budget linearly
+  PASS absolute epoch cap bounds every regime
+  PASS engine merkle root + anchor accepted by DiamondDistributor
+  PASS b1 claimed engine-weighted DIAMOND on-chain
+  PASS b2 claimed with sorted-pair proof
+  PASS tree contains exactly the two eligible losers
+
+==== engine: 51 passed, 0 failed ====
+This version of µWS is not compatible with your Node.js build:
+
+Error: Cannot find module '../binaries/uws_linux_x64_127.node'
+Require stack:
+- /home/user/go-f3/diamondtrading/node_modules/ganache/node_modules/@trufflesuite/uws-js-unofficial/src/uws.js
+- /home/user/go-f3/diamondtrading/node_modules/ganache/dist/node/core.js
+- /home/user/go-f3/diamondtrading/test/fuzz.js
+Falling back to a NodeJS implementation; performance may be degraded.
+
+
+fuzz-v3 SEED=1337 OPS=150: OK — 160 checks, 34 buys, 24 settles, 8 stall refunds, 47 harvests, 15 FIFO payments (follow-ups 40), 0 distributions, founder=0 stakerFees=0 | end: pool=0 debt=166664731500 (7 expected reverts)
+EXIT=0

@@ -9,6 +9,10 @@
 //   else goes entirely to the FIFO (no jumping the line). Premiums are house income → pool,
 //   directly, always (papertrade rule). No QMAX, no pause: positions sell regardless of debt.
 //   claimInfo(option-id) reports queue position + amount owed.
+//
+// AUDIT FIXES (see audit/report): F-01 solvency lane check + owner sweep; F-08 exact approvals,
+// timelocked verifier/quoter; F-09 ttl signed; F-10 single-use quotes; F-11 non-stalling payouts;
+// F-12 no zero-value queue entries.
 pragma solidity 0.8.26;
 
 interface IERC20MinO {
@@ -40,6 +44,7 @@ contract DiamondOptions {
         uint64  validUntil;
         bytes32 salt;
         address buyer;
+        uint64  ttl;            // F-09: duration signed with the quote
     }
     struct Option_ {
         address owner;
@@ -71,7 +76,9 @@ contract DiamondOptions {
 
     bytes32 public constant OQUOTE_TYPEHASH = keccak256(
         "OQuote(uint8 classId,uint8 dir,uint128 premium,uint32 multX1e4,uint32 bandBps,"
-        "uint64 strikeX1e8,uint64 validUntil,bytes32 salt,address buyer)");
+        "uint64 strikeX1e8,uint64 validUntil,bytes32 salt,address buyer,uint64 ttl)");
+    uint256 public constant GOV_DELAY = 2 days;  // F-08
+    uint256 public constant SEND_GAS_FLOOR = 60_000;  // F-11
 
     IERC20MinO public immutable usdc;
     bytes32 public immutable DOMAIN_SEPARATOR;
@@ -85,6 +92,13 @@ contract DiamondOptions {
     address public revenueSink;
     address public founderWallet;
 
+    // F-10 / F-11 / F-08 state
+    mapping(bytes32 => bool) public quoteUsed;
+    mapping(address => uint256) public credits;
+    uint256 public totalCredits;
+    struct Pending { address who; uint64 eta; }
+    Pending public pendingQuoter;
+    Pending public pendingPriceVerifier;
 
     Option_[]   public options;
     QueueEntry[] public payoutQueue;
@@ -104,6 +118,9 @@ contract DiamondOptions {
     event OQueued(uint256 indexed entryId, uint256 indexed optionId, address owner, uint256 amount);
     event ODequeued(uint256 indexed entryId, address owner, uint256 amount);
     event ParamSet(string what, uint256 value);
+    event Credited(address indexed to, uint256 amount);
+    event CreditWithdrawn(address indexed to, uint256 amount);
+    event GovProposed(string what, address who, uint64 eta);
 
     constructor(address _usdc, address _quoter) {
         require(_usdc != address(0) && _quoter != address(0), "zero addr");
@@ -116,8 +133,15 @@ contract DiamondOptions {
         ));
     }
 
+    /// F-01 fix: solvency, not equality. Donations cannot freeze the book.
     function lanesIntact() public view returns (bool) {
-        return usdc.balanceOf(address(this)) == pool + openPremiums;
+        return usdc.balanceOf(address(this)) >= pool + openPremiums + totalCredits;
+    }
+    function sweepSurplus(address to) external onlyOwner nonReentrant {
+        uint256 b = usdc.balanceOf(address(this));
+        uint256 owed = pool + openPremiums + totalCredits;
+        require(b > owed, "no surplus");
+        require(usdc.transfer(to, b - owed), "sweep out");
     }
 
     /// queue transparency: position (1 = next to pay) + amount owed; hasDebt=false when clean.
@@ -157,6 +181,7 @@ contract DiamondOptions {
         require(q.multX1e4 >= MIN_MULT_X1E4 && q.multX1e4 <= MAX_MULT_X1E4, "mult clamp");
         require(q.bandBps >= MIN_BAND_BPS && q.bandBps <= MAX_BAND_BPS, "band clamp");
         require(q.strikeX1e8 >= MIN_STRIKE_X1E8, "strike floor");
+        require(q.ttl == ttl, "ttl mismatch");                       // F-09
         // strike slippage guard: buyer pins the worst strike they will accept
         if (q.dir == CALL) require(q.strikeX1e8 <= worstStrikeX1e8, "strike worse");
         else               require(q.strikeX1e8 >= worstStrikeX1e8, "strike worse");
@@ -167,9 +192,11 @@ contract DiamondOptions {
 
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR,
             keccak256(abi.encode(OQUOTE_TYPEHASH, q.classId, q.dir, q.premium, q.multX1e4,
-                                 q.bandBps, q.strikeX1e8, q.validUntil, q.salt, msg.sender))));
+                                 q.bandBps, q.strikeX1e8, q.validUntil, q.salt, msg.sender, q.ttl))));
         require(_recoverSig(digest, sig) == quoterSigner, "bad quote sig");
         require(q.buyer == msg.sender, "quote not yours");
+        require(!quoteUsed[digest], "quote used");                   // F-10
+        quoteUsed[digest] = true;
 
         uint256 premium = q.premium;
         uint256 maxPay = premium * q.multX1e4 / 10_000;
@@ -219,7 +246,7 @@ contract DiamondOptions {
                 _enqueue(o.owner, net, uint64(id));
             }
             o.queuedPay = uint128(net - paidNow);
-            if (paidNow > 0) require(usdc.transfer(o.owner, paidNow), "pay out");
+            _send(o.owner, paidNow);
         }
 
         emit OSettled(id, closePx, payout, paidNow, net - paidNow, feeTaken);
@@ -242,8 +269,11 @@ contract DiamondOptions {
         uint256 total = founderAmt + stakerAmt;
         if (total == 0 || pool < total) return; // no realized cash: retain in pool, never underflow
         pool -= total;
-        if (founderAmt > 0) require(usdc.transfer(founder, founderAmt), "founder out");
-        if (stakerAmt > 0) IRevenueSinkO(sink).notifyRevenue(stakerAmt);
+        if (founderAmt > 0) _send(founder, founderAmt);
+        if (stakerAmt > 0) {
+            require(usdc.approve(sink, stakerAmt), "approve");  // F-08: exact allowance
+            IRevenueSinkO(sink).notifyRevenue(stakerAmt);
+        }
         emit FeeStreamed(id, founderAmt, stakerAmt);
     }
     /// Attester stall > 24h past expiry ⇒ premium back verbatim.
@@ -253,12 +283,35 @@ contract DiamondOptions {
         require(block.timestamp >= o.expiry + STALL_DELAY, "not stalled");
         o.state = 2;
         openPremiums -= o.premium;
-        require(usdc.transfer(o.owner, o.premium), "refund out");
+        _send(o.owner, o.premium);
         emit ORefunded(id, o.premium);
         require(lanesIntact(), "lane drift");
     }
 
+    /// F-11: refused transfers are credited for pull-withdrawal instead of reverting the queue.
+    function _send(address to, uint256 amount) internal {
+        if (amount == 0) return;
+        // gas floor: a caller must not be able to starve the token call so that it fails and the
+        // payout silently becomes a credit (no theft, but a griefing path). Revert instead.
+        require(gasleft() >= SEND_GAS_FLOOR, "send gas");
+        (bool ok, bytes memory ret) = address(usdc).call(
+            abi.encodeWithSelector(IERC20MinO.transfer.selector, to, amount));
+        if (ok && (ret.length == 0 || abi.decode(ret, (bool)))) return;
+        credits[to] += amount;
+        totalCredits += amount;
+        emit Credited(to, amount);
+    }
+    function withdrawCredit() external nonReentrant {
+        uint256 a = credits[msg.sender];
+        require(a > 0, "no credit");
+        credits[msg.sender] = 0;
+        totalCredits -= a;
+        require(usdc.transfer(msg.sender, a), "credit out");
+        emit CreditWithdrawn(msg.sender, a);
+    }
+
     function _enqueue(address who, uint256 amount, uint64 optionId) internal {
+        if (amount == 0) return;                                     // F-12
         payoutQueue.push(QueueEntry({ owner: who, amount: uint128(amount), optionId: optionId }));
         queueDebt += amount;
         queueOf[optionId] = payoutQueue.length; // entryId+1 for claimInfo()
@@ -272,7 +325,7 @@ contract DiamondOptions {
             e.amount -= uint128(pay);
             pool -= pay;
             queueDebt -= pay;
-            require(usdc.transfer(e.owner, pay), "queue out");
+            _send(e.owner, pay);                                    // F-11
             emit ODequeued(queueHead, e.owner, pay);
             if (e.amount == 0) queueHead++;
             n--;
@@ -287,17 +340,46 @@ contract DiamondOptions {
     // ---------------- governance ----------------
     function setClassCfg(uint8 classId, uint32 maxMult2, uint64 payCap, bool enabled) external onlyOwner {
         require(maxMult2 >= MIN_MULT_X1E4 && maxMult2 <= MAX_MULT_X1E4, "class mult range");
+        ClassCfg memory old = classCfg[classId];
+        if (old.enabled) require(maxMult2 <= old.maxMultX1e4 && payCap <= old.payCap, "tighten only");
         classCfg[classId] = ClassCfg(maxMult2, payCap, enabled);
         emit ParamSet("classCfg", uint256(classId));
     }
-    function setQuoter(address qa) external onlyOwner { require(qa != address(0), "zero"); quoterSigner = qa; emit ParamSet("quoter", uint256(uint160(qa))); }
+    function proposeQuoter(address qa) external onlyOwner {
+        require(qa != address(0), "zero");
+        pendingQuoter = Pending(qa, uint64(block.timestamp + GOV_DELAY));
+        emit GovProposed("quoter", qa, pendingQuoter.eta);
+    }
+    function executeQuoter() external {
+        Pending memory p = pendingQuoter;
+        require(p.who != address(0) && block.timestamp >= p.eta, "not ready");
+        quoterSigner = p.who; delete pendingQuoter;
+        emit ParamSet("quoter", uint256(uint160(p.who)));
+    }
+    function proposePriceVerifier(address v) external onlyOwner {
+        require(v != address(0), "zero");
+        pendingPriceVerifier = Pending(v, uint64(block.timestamp + GOV_DELAY));
+        emit GovProposed("verifier", v, pendingPriceVerifier.eta);
+    }
+    function executePriceVerifier() external {
+        Pending memory p = pendingPriceVerifier;
+        require(p.who != address(0) && block.timestamp >= p.eta, "not ready");
+        priceVerifier = p.who; delete pendingPriceVerifier;
+        emit ParamSet("verifier", uint256(uint160(p.who)));
+    }
+    /// Rotating the sink revokes the previous sink's allowance (F-08).
     function setRevenueSink(address s) external onlyOwner {
+        require(s.code.length > 0, "sink must be a contract");   // F-08: an EOA sink would brick settlements
+        if (revenueSink != address(0)) usdc.approve(revenueSink, 0);
         revenueSink = s;
-        require(usdc.approve(s, type(uint256).max), "approve");
         emit ParamSet("revenueSink", uint256(uint160(s)));
     }
     function setFounderWallet(address f) external onlyOwner { founderWallet = f; emit ParamSet("founderWallet", uint256(uint160(f))); }
-    function setPriceVerifier(address v) external onlyOwner { require(v != address(0), "zero"); priceVerifier = v; emit ParamSet("verifier", uint256(uint160(v))); }
+    /// Initial wiring only (zero → value); afterwards use proposePriceVerifier / executePriceVerifier.
+    function setPriceVerifier(address v) external onlyOwner {
+        require(v != address(0) && priceVerifier == address(0), "timelocked: use proposePriceVerifier");
+        priceVerifier = v; emit ParamSet("verifier", uint256(uint160(v)));
+    }
 
     function _recoverSig(bytes32 digest, bytes calldata sig) internal pure returns (address) {
         require(sig.length == 65, "sig len");

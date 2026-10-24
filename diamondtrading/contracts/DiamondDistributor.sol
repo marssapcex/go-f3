@@ -29,25 +29,34 @@ interface IDiamondToken {
 ///         priceX1e8  = internal reference price during bootstrap (attester-signed); TWAP-chained
 ///                      after transfers open. Signed, never free-param.
 ///         An absolute per-epoch token cap (epochCap) bounds any anchor-inflation attempt.
+///
+/// AUDIT FIXES (audit/report):
+///  F-14: launch rate is 100% of the REALIZED house revenue (not 200%), and the anchor is the
+///        realized edge only (fees are already inside stake − payout; adding them double-counted).
+///  F-03: total claims against an epoch can never exceed that epoch's posted totalMint, so a
+///        leaked root/owner key cannot mint beyond the budget the attester signed.
+///  F-12b: a budgetAttester must be configured before any epoch can be posted.
+///  D2:   the budget signature is bound to chainid + this contract (no cross-deployment replay).
 contract DiamondDistributor {
     IDiamondToken public immutable diamond;
     address public owner;
     address public budgetAttester; // bonded off-chain accountant; signs (epoch, anchor, price)
 
     uint256 public constant BPS = 10_000;
-    uint256 public constant R_MAX_BPS = 20_000;    // 200% launch/bait ceiling
+    uint256 public constant R_MAX_BPS = 10_000;    // 100% ceiling: never mint more than realized revenue (F-14)
     uint256 public constant R_FLOOR_BPS = 3_000;   // 30% tighten floor
     uint256 public constant STEP_DOWN_BPS = 250;   // tighten per growth epoch (slow grind)
     uint256 public constant STEP_UP_BPS = 1_000;   // ease per weak epoch (fast re-bait)
     uint256 public constant MAX_EPOCH_GAP = 7 days;
 
-    uint256 public rateBps = R_MAX_BPS;     // starts rich (bootstrap)
+    uint256 public rateBps = R_MAX_BPS;     // starts at ceiling (bootstrap)
     uint256 public prevAnchorUsd;           // last epoch's signed anchor (reaction reference)
 
     uint256 public epochCap = 2_000_000e18;      // absolute per-epoch mint cap (≈0.5% genesis scale)
     uint256 public constant EPOCH_CAP_CEILING = 5_000_000e18;
 
     struct Epoch { bytes32 root; uint256 totalMint; uint64 postedAt; }
+    mapping(uint256 => uint256) public epochClaimed;   // F-03: running total claimed per epoch
     mapping(uint256 => Epoch) public epochs;
     uint256 public lastEpoch;
     mapping(uint256 => mapping(address => bool)) public claimed;
@@ -109,10 +118,11 @@ contract DiamondDistributor {
         uint256 priceX1e8,
         bytes calldata budgetSig
     ) external onlyOwner {
+        require(budgetAttester != address(0), "no budget attester");   // F-12b
         require(epochId == lastEpoch + 1, "epoch order");
         require(epochs[epochId].root == bytes32(0), "posted");
         bytes32 h = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32",
-                        keccak256(abi.encode(epochId, anchorUsd, priceX1e8))));
+                        keccak256(abi.encode(block.chainid, address(this), epochId, anchorUsd, priceX1e8))));
         require(_rec(h, budgetSig) == budgetAttester, "bad budget sig");
         uint256 budget = budgetFor(anchorUsd, priceX1e8);   // uses projected (adaptive) rate
         require(totalMint <= budget, "over budget");        // rate×anchor AND absolute cap
@@ -131,6 +141,8 @@ contract DiamondDistributor {
         require(!claimed[epochId][msg.sender], "claimed");
         bytes32 leaf = keccak256(bytes.concat(keccak256(abi.encode(epochId, msg.sender, amount))));
         require(_verify(leaf, e.root, proof), "bad proof");
+        require(epochClaimed[epochId] + amount <= e.totalMint, "epoch budget exhausted");  // F-03
+        epochClaimed[epochId] += amount;
         claimed[epochId][msg.sender] = true;
         totalMinted += amount;
         diamond.mint(msg.sender, amount);
@@ -161,4 +173,9 @@ contract DiamondDistributor {
     }
 
     function transferOwnership(address n) external onlyOwner { require(n != address(0), "zero"); owner = n; }
+
+    /// Inner budget hash; the signed message is its EIP-191 wrap (engine mirror: signRevenueAnchor).
+    function budgetHash(uint256 epochId, uint256 anchorUsd, uint256 priceX1e8) public view returns (bytes32) {
+        return keccak256(abi.encode(block.chainid, address(this), epochId, anchorUsd, priceX1e8));
+    }
 }
